@@ -1,0 +1,3 @@
+#!/bin/sh
+# Tor Browser runs as its own user (torbrowser), started by greeterd's appbox: see /usr/local/lib/lacuna/appbox.
+exec /usr/local/bin/lacuna-launch tor-browser "$@"

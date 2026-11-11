@@ -1,0 +1,14 @@
+[Unit]
+Description=Lacuna greeter daemon (vault unlock, network, admin password, hand-off)
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=greetd.service
+
+[Service]
+ExecStart=/usr/local/lib/lacuna/greeterd
+Restart=on-failure
+# no PrivateTmp or other namespacing: the vault mounts it makes must be visible to the session
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

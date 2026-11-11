@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lacuna Settings
+GenericName=Network mode, PIA account, persistence
+Comment=Change how Lacuna connects (Tor, PIA, bridges, restricted networks), the PIA account and what is kept
+Exec=foot -T "Lacuna Settings" -a lacuna-settings lacuna-greeter --settings
+Icon=preferences-system
+Categories=Settings;System;
+Terminal=false

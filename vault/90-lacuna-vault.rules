@@ -1,0 +1,7 @@
+# The vault's device-mapper devices and the loop devices under them: not shown in file managers, never auto-mounted
+# (vault mounts them itself, at ~/Private and ~/Persistent).
+SUBSYSTEM!="block", GOTO="lacuna_vault_end"
+ENV{DM_NAME}=="lacuna-v*", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
+ENV{DM_NAME}=="sflc_*", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
+KERNEL=="loop*", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
+LABEL="lacuna_vault_end"

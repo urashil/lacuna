@@ -1,0 +1,18 @@
+[Unit]
+Description=Wipe and power off when the boot stick is removed
+DefaultDependencies=no
+After=systemd-udevd.service systemd-udev-trigger.service local-fs.target
+Wants=systemd-udevd.service
+Before=sysinit.target
+
+[Service]
+# stays running (polling from RAM) for the whole session. Its own slice, outside system.slice and user.slice, which
+# wipe freezes and kills: nothing systemd restarts can come back, and wipe itself is never caught up in it.
+Type=exec
+Slice=lacuna-wipe.slice
+ExecStart=/usr/local/lib/lacuna/stickwatch
+Restart=no
+TimeoutStopSec=2
+
+[Install]
+WantedBy=sysinit.target

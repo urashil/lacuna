@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# appbox APP WAYLAND_SOCKET [URL]: start an app as its own system user, on the live user's screen (root; called by
+# greeterd for the session, which can't do this itself).
+#   tor-browser      user torbrowser. In the Tor modes it uses the system Tor (SOCKS 9150, isolated per site);
+#                    otherwise its own Tor. Profile in RAM (/run/lacuna-apps/torbrowser) for this session.
+#   unsafe-browser   user clearnet: Chromium straight onto the local network, for Wi-Fi sign-in ("captive")
+#                    pages. Only when it was allowed in the greeter (the firewall lets that user out then, and
+#                    only that user). NOT anonymous. A fresh, empty profile every time.
+# The app reaches the screen and the sound through file ACLs on the live user's Wayland and PipeWire/Pulse
+# sockets; downloads go to ~/Downloads/<App>, which the live user owns.
+set -euo pipefail
+app=${1:?app} wl=${2:?wayland socket} url=${3:-}
+LIVE=amnesia
+uid=$(id -u $LIVE)
+rt=/run/user/$uid
+[[ $wl =~ ^wayland-[0-9]+$ && -S $rt/$wl ]] || { echo "appbox: no such Wayland socket" >&2; exit 1; }
+
+case $app in
+    tor-browser)    U=torbrowser dl="Tor Browser" ;;
+    unsafe-browser) U=clearnet dl="Unsafe Browser"
+                    [[ -e /run/lacuna/unsafe ]] || {
+                        echo "appbox: the Unsafe Browser wasn't allowed in the greeter (or Lacuna Settings)" >&2; exit 1; } ;;
+    *) echo "appbox: unknown app" >&2; exit 1 ;;
+esac
+[[ -z $url || $url =~ ^https?://[[:graph:]]+$ ]] || { echo "appbox: bad URL" >&2; exit 1; }
+
+# screen and sound
+setfacl -m "u:$U:x" "$rt"
+setfacl -m "u:$U:rw" "$rt/$wl"
+[[ -S $rt/pipewire-0 ]] && setfacl -m "u:$U:rw" "$rt/pipewire-0"
+[[ -d $rt/pulse ]] && setfacl -m "u:$U:x" "$rt/pulse" && setfacl -m "u:$U:rw" "$rt/pulse/native" 2>/dev/null || true
+
+# downloads: a folder in the live user's home that both can use
+H=/home/$LIVE
+D="$H/Downloads/$dl"
+install -d -o $LIVE -g $LIVE -m 755 "$H/Downloads"
+install -d -o $LIVE -g $LIVE -m 770 "$D"
+setfacl -m "u:$U:x" "$H" "$H/Downloads"
+setfacl -m "u:$U:rwx" -m "d:u:$U:rwx" -m "d:u:$LIVE:rwx" "$D"
+
+home=/run/lacuna-apps/$U
+install -d -m 755 /run/lacuna-apps
+[[ $app == unsafe-browser ]] && rm -rf "$home"          # nothing carried over between uses
+install -d -o $U -g $U -m 700 "$home" "$home/run"
+
+env=(--setenv=HOME="$home" --setenv=XDG_RUNTIME_DIR="$home/run" --setenv=WAYLAND_DISPLAY="$rt/$wl"
+     --setenv=PULSE_SERVER="unix:$rt/pulse/native" --setenv=PIPEWIRE_REMOTE="$rt/pipewire-0"
+     --setenv=XDG_DOWNLOAD_DIR="$D" --setenv=LANG=C.UTF-8 --setenv=XCURSOR_THEME=capitaine-cursors
+     --setenv=XCURSOR_SIZE=24 --setenv=PATH=/usr/bin)
+props=(-p PrivateTmp=yes -p KillMode=control-group -p ProtectSystem=strict -p "ReadWritePaths=$home \"$D\"")
+unit="lacuna-$app-$(date +%s%N | tail -c 7)"
+
+case $app in
+    tor-browser)
+        dir=$home/tor-browser
+        if [[ ! -x $dir/Browser/start-tor-browser ]] || ! cmp -s /opt/tor-browser/LACUNA_VERSION "$dir/LACUNA_VERSION"; then
+            rm -rf "$dir"; cp -a /opt/tor-browser "$dir"; chown -R $U:$U "$dir"
+        fi
+        prefs=$dir/Browser/TorBrowser/Data/Browser/profile.default/user.js
+        install -d -o $U -g $U "$(dirname "$prefs")"
+        printf 'user_pref("browser.download.dir", "%s");\nuser_pref("browser.download.folderList", 2);\n' "$D" > "$prefs"
+        chown $U:$U "$prefs"
+        case $(cat /run/lacuna-gate-mode 2>/dev/null) in
+            tor|tor-socks|tor+*)
+                env+=(--setenv=TOR_SKIP_LAUNCH=1 --setenv=TOR_SKIP_CONTROLPORTTEST=1 --setenv=TOR_NONINTERACTIVE=1
+                      --setenv=TOR_SOCKS_HOST=127.0.0.1 --setenv=TOR_SOCKS_PORT=9150 --setenv=TOR_PROVIDER=none) ;;
+        esac
+        env+=(--setenv=MOZ_ENABLE_WAYLAND=1)
+        props+=(-p NoNewPrivileges=yes)
+        cmd=("$dir/Browser/start-tor-browser" ${url:+"$url"}) ;;
+    unsafe-browser)
+        # Chromium's own sandbox is its setuid helper here (no user namespaces on this kernel): no NoNewPrivileges
+        cmd=(/usr/bin/chromium --user-data-dir="$home/profile" --no-first-run --no-default-browser-check
+             --disable-sync --disable-background-networking --ozone-platform=wayland --class=unsafe-browser
+             --password-store=basic file:///usr/share/lacuna/unsafe-browser.html "${url:-http://neverssl.com/}") ;;
+esac
+exec systemd-run --quiet --collect --no-block --unit="$unit" --uid=$U --gid=$U "${props[@]}" "${env[@]}" -- "${cmd[@]}"

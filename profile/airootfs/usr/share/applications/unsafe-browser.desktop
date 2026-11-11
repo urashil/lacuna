@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Unsafe Browser
+GenericName=Wi-Fi sign-in pages (NOT anonymous)
+Comment=Chromium straight onto the local network, for hotel/café Wi-Fi sign-in pages. Not through Tor or PIA.
+Exec=/usr/local/bin/lacuna-launch unsafe-browser
+Icon=dialog-warning
+Categories=Network;
+Terminal=false

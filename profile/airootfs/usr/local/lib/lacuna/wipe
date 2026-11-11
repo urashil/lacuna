@@ -1,0 +1,82 @@
+#!/run/lacuna/busybox sh
+# wipe: emergency stop (boot stick pulled, or locked for 6 hours: reaper). Like Tails: the screen goes black at
+# once, every process is killed, everything that lived in RAM is deleted, the free memory is overwritten, then the
+# machine powers off immediately. Runs from /run with a static busybox, so it works with the stick gone.
+#
+# `kill` here MUST be the shell's builtin: `kill -9 -1` kills every process except the caller and PID 1, so run as
+# a separate busybox process it would kill this script too (which is what happened in the first version).
+# It runs as the stickwatch service's own process (lacuna-wipe.slice), never in the slices it freezes and kills.
+B=/run/lacuna/busybox
+trap '' HUP INT TERM PIPE              # nothing may stop this script now
+
+# 1. black screen and nothing else running. The backlight goes off first (on some panels that only dims).
+for f in /sys/class/backlight/*/bl_power; do [ -e "$f" ] && echo 4 > "$f" 2>/dev/null; done
+for f in /sys/class/backlight/*/brightness; do [ -e "$f" ] && echo 0 > "$f" 2>/dev/null; done
+# Freeze the services and the sessions: systemd can restart a unit, but its processes start inside the frozen
+# slice and never run. Then kill them all at once (cgroup.kill), plus a builtin kill for anything outside.
+for c in /sys/fs/cgroup/user.slice /sys/fs/cgroup/system.slice; do
+    [ -e "$c/cgroup.freeze" ] && echo 1 > "$c/cgroup.freeze" 2>/dev/null
+done
+for c in /sys/fs/cgroup/user.slice /sys/fs/cgroup/system.slice; do
+    [ -e "$c/cgroup.kill" ] && echo 1 > "$c/cgroup.kill" 2>/dev/null
+done
+kill -9 -1 2>/dev/null                 # builtin: everything but PID 1 and this shell
+
+# Watchdog: whatever below might hang, the machine is off within this many seconds (more RAM, more to overwrite).
+# Started after the kill above, which would take it too.
+mem=$($B awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null)
+( $B sleep $(( 20 + ${mem:-16} * 2 )); echo o > /proc/sysrq-trigger ) &
+
+# The display: with the compositor dead the kernel console takes the screen back; make that empty and blank it.
+# Nothing here may wait: a VT switch blocks until the old owner of the screen lets go (a frozen niri never did:
+# the screen just froze), so chvt goes to the background and is never waited for.
+$B chvt 12 2>/dev/null &
+for t in /dev/tty0 /dev/tty1 /dev/tty12; do printf '\033[2J\033[H\033[?25l\033[30;40m' > "$t" 2>/dev/null; done
+$B usleep 300000
+for f in /sys/class/graphics/fb*/blank; do [ -e "$f" ] && echo 4 > "$f" 2>/dev/null; done
+
+# 2. vault: unmount it (lazily: nothing may block here) BEFORE anything is deleted, so the deletes below can never
+#    reach into the persistence, then destroy the device-mapper tables, which wipes the volume keys in the kernel.
+#    From the reaper (stick still in): write out what is cached and unmount properly first, so the persistence is
+#    left clean. A pulled stick can't be written any more, and a sync there could hang: lazy only.
+if [ -e /run/lacuna/reap ]; then
+    $B sync
+    if [ -s /run/lacuna/vault-mounts ]; then
+        while read -r m; do $B umount "$m" 2>/dev/null; done < /run/lacuna/vault-mounts
+    fi
+fi
+if [ -s /run/lacuna/vault-mounts ]; then
+    while read -r m; do $B umount -l "$m" 2>/dev/null; done < /run/lacuna/vault-mounts
+fi
+DM="/run/lacuna/dm/ld-linux-x86-64.so.2 --library-path /run/lacuna/dm /run/lacuna/dm/dmsetup"
+for m in /dev/mapper/sflc_* /dev/mapper/lacuna-v2 /dev/mapper/lacuna-v1 /dev/mapper/lacuna-v0; do
+    [ -e "$m" ] && $DM --noudevsync remove --force "${m#/dev/mapper/}" >/dev/null 2>&1   # sflc_*: Shufflecake
+done
+if [ -s /run/lacuna/vault-loops ]; then
+    while read -r l; do $B losetup -d "$l" 2>/dev/null; done < /run/lacuna/vault-loops
+fi
+
+# 3. what was in RAM: init_on_free=1 zeroes every page as it is freed
+for d in /run/archiso/cowspace/*/*/upperdir /home /tmp /var/tmp /dev/shm /run/user /root /var/log; do
+    [ -d "$d" ] && $B rm -rf "$d"/* "$d"/.[!.]* 2>/dev/null
+done
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+
+# 4. overwrite the free memory: fill a RAM filesystem with zeros up to (almost) all available memory, then free it
+#    (freeing zeroes it once more). A margin stays free so the out-of-memory killer never picks this script.
+avail=$($B awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+margin=131072                          # KiB (128 MiB)
+if [ -n "$avail" ] && [ "$avail" -gt $((margin * 2)) ]; then
+    $B mkdir -p /run/lacuna/fill
+    if $B mount -t tmpfs -o size=$(( avail - margin ))k,mode=700 lacuna-fill /run/lacuna/fill 2>/dev/null; then
+        $B dd if=/dev/zero of=/run/lacuna/fill/zero bs=1M 2>/dev/null
+        $B rm -f /run/lacuna/fill/zero
+        $B umount /run/lacuna/fill 2>/dev/null
+    fi
+fi
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+
+# 5. off, now (writing the trigger works whatever kernel.sysrq says); poweroff -f if it somehow didn't
+echo o > /proc/sysrq-trigger 2>/dev/null
+$B sleep 2
+$B poweroff -f

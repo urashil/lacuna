@@ -1,0 +1,14 @@
+#!/bin/sh
+# login-gate: pam_exec helper for greetd. Lets `amnesia` in without a password exactly once, right after the
+# greeter finished (greeterd writes the gate file, root-only). Anything else falls through to the normal password
+# check, where the account stays locked unless a password was set.
+PATH=/usr/bin:/bin                     # pam_exec runs this with no PATH at all
+export PATH
+gate=/run/lacuna/login-allowed
+[ "$PAM_USER" = amnesia ] || exit 1
+[ "$PAM_SERVICE" = greetd ] || exit 1
+[ -f "$gate" ] || exit 1
+age=$(( $(date +%s) - $(cut -d. -f1 "$gate") ))
+rm -f "$gate"                          # one use only
+[ "$age" -ge 0 ] && [ "$age" -le 120 ] || exit 1
+exit 0

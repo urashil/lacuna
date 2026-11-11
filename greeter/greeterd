@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""greeterd: the root side of the Lacuna greeter (PLAN section 3).
+
+Listens on /run/greeterd/greeterd.sock. Only the `greeter` user may connect (SO_PEERCRED); the TUI never holds any
+privilege. One JSON object per line in each direction. Secrets (passphrase, Wi-Fi key, admin password) arrive in
+requests only, are never written to argv, logs or disk, and are dropped as soon as they are used.
+
+Requests ("op"):
+  state                              what the TUI needs to draw (vault, password, MAC, devices, mode)
+  unlock        passphrase           try the vault; always answers the same way and takes the same time
+  set_password  password|null        admin + lock-screen password for `amnesia` (null: keep it locked)
+  set_mac       random: bool         MAC randomization (default on; NICs already start randomized)
+  wifi_scan                          visible networks
+  wifi_connect  ssid, password|null  join a network (the key goes to NetworkManager through a pipe)
+  set_mode      mode, bridges, vpn   tor | VPN | tor+VPN | offline (| direct with lacuna.direct), VPN = pia|mullvad|
+                                     ivpn: applied by `gate` in the background; vpn = the account (PIA: {username,
+                                     password}; Mullvad/IVPN: {account}) unless one is saved
+  gate_status                        mode being applied, Tor bootstrap %, PIA state, last error
+  finish                             everything chosen: allow the one hand-off login for `amnesia`
+"""
+import grp, hmac, json, os, pwd, socket, struct, subprocess, sys, threading, time
+
+SOCK = "/run/greeterd/greeterd.sock"       # 0666: serve() checks who connects (greeter, or the live user)
+LOGIN_FLAG = "/run/lacuna/login-allowed"       # read by PAM (pam_exec) for the one hand-off login
+USER = "amnesia"
+UNLOCK_SECONDS = 15.0                    # every answer takes this long: VeraCrypt hidden + outer and Shufflecake, at once
+VAULT = "/usr/local/bin/vault"
+VPNS = ("pia", "mullvad", "ivpn")
+MODES = {"direct", "offline", "tor", "tor-socks"} | set(VPNS) | {"tor+" + v for v in VPNS}
+# the opsec session (labwc): Tor only, SOCKS-only (no redirect), no VPN, no Unsafe Browser; extra apps by name
+OPSEC_MODES = {"tor-socks", "offline"}
+OPSEC_APPS = ("thunderbird", "signal", "element", "electrum", "monero", "simplex", "spotify", "mpv")
+OPSEC_APPS_FILE = "/run/lacuna-opsec-apps"      # world-readable: the session script reads it (not secret)
+CREDS = "/run/lacuna/vpn-credentials"     # gate hands it to the VPN's client and deletes it
+vpn_saved = {}                           # vpn -> account, restored from the vault (or verified this session)
+vpn_new = None                           # (vpn, account) typed this session: saved once it has logged in
+STICKLESS = "lacuna.stickless" in open("/proc/cmdline").read().split()
+GATE_READY = True
+DIRECT_OK = "lacuna.direct" in open("/proc/cmdline").read().split()   # development only
+GATE = "/usr/local/lib/lacuna/gate"
+gate_job = {"mode": None, "running": False, "error": None}
+
+state = {"vault": "locked", "password_set": False, "mac_random": True, "mode": None, "bridges": [],
+         "restricted": False, "unsafe": False, "saved_unsafe": False, "saved_mode": None,
+         "session": "normal", "saved_session": None, "apps": [], "saved_apps": [], "saved_bridges": [], "saved_restricted": False, "handed_off": False}
+# what the live user's session may ask for (Lacuna Settings); everything else is the greeter's alone
+SESSION_OPS = {"state", "gate_status", "set_mode", "features", "set_feature", "set_password", "launch", "set_unsafe",
+               "leaktest"}   # not set_session / set_apps: those are decided before the session starts
+APPBOX = "/usr/local/lib/lacuna/appbox"
+UNSAFE = "/run/lacuna/unsafe"             # the Unsafe Browser's user may go out directly (gate reads it)
+vault_kind = None                        # "hidden" (settings can be saved) or "decoy" (read-only); never sent out
+lock = threading.Lock()
+
+
+def log(msg):                            # op names and outcomes only, never values
+    print(f"greeterd: {msg}", file=sys.stderr, flush=True)
+
+
+def run(cmd, data=None, timeout=60):
+    return subprocess.run(cmd, input=data, capture_output=True, text=True, timeout=timeout)
+
+
+def password_is_set():
+    try:
+        with open("/etc/shadow") as f:
+            for line in f:
+                name, pw = line.split(":", 2)[:2]
+                if name == USER:
+                    return bool(pw) and not pw.startswith(("!", "*"))
+    except OSError:
+        pass
+    return False
+
+
+# ---- vault (milestone 5): a wrong passphrase and "no vault here" must look and time exactly the same ----
+def unlock(passphrase):
+    """Hidden-then-decoy attempt (vault does both at once), then the saved settings. The answer always comes after
+    UNLOCK_SECONDS and says only "unlocked" or "none", so the decoy passphrase looks like the real one."""
+    global vault_kind
+    start = time.monotonic()
+    found = False
+    try:
+        out = json.loads(run([VAULT, "unlock"], data=passphrase, timeout=120).stdout or "{}")
+        found = out.get("result") == "unlocked"
+        vault_kind = out.get("kind") if found else None
+    except (ValueError, subprocess.SubprocessError, OSError) as e:
+        log(f"vault: {type(e).__name__}")
+    del passphrase
+    if vault_kind == "hidden":
+        try:
+            restore_settings()
+        except Exception as e:                          # a broken settings file must not block the boot
+            log(f"restore: {type(e).__name__}")
+    time.sleep(max(0.0, UNLOCK_SECONDS - (time.monotonic() - start)))
+    if found:
+        state["vault"] = "unlocked"
+    return {"ok": True, "result": "unlocked" if found else "none"}
+
+
+def restore_settings():
+    """Each piece on its own: one that fails (logged by name only) doesn't stop the others."""
+    s = json.loads(run([VAULT, "settings", "get"]).stdout or "{}")
+
+    def password():
+        h = s.get("password_hash")
+        if isinstance(h, str) and h.startswith("$") and ":" not in h and "\n" not in h:
+            run(["chpasswd", "-e"], data=f"{USER}:{h}\n")   # a hash only: the password itself is never stored
+            state["password_set"] = password_is_set()
+            publish_password_flag()
+
+    def network():
+        if s.get("mode") in MODES - {"direct"}:
+            state["saved_mode"] = s["mode"]
+        if isinstance(s.get("bridges"), list):
+            state["saved_bridges"] = [b for b in s["bridges"] if isinstance(b, str)][:20]
+        state["saved_restricted"] = s.get("restricted") is True
+        state["saved_unsafe"] = s.get("unsafe") is True
+        if s.get("session") in ("normal", "opsec"):
+            state["saved_session"] = s["session"]
+        if isinstance(s.get("apps"), list):
+            state["saved_apps"] = [a for a in s["apps"] if a in OPSEC_APPS]
+
+    def pia():                                          # the VPN accounts (and the older PIA-only entry)
+        accounts = dict(s.get("vpn_accounts") or {})
+        if isinstance(s.get("pia"), dict):
+            accounts.setdefault("pia", s["pia"])
+        for v, a in accounts.items():
+            if v in VPNS and isinstance(a, dict) and account_ok(v, a):
+                vpn_saved[v] = {k: str(a[k]) for k in ("username", "password", "account") if a.get(k)}
+
+    def mac():
+        if isinstance(s.get("mac_random"), bool):
+            set_mac(s["mac_random"])
+
+    for step in (password, network, pia, mac):
+        try:
+            step()
+        except Exception as e:
+            log(f"restore {step.__name__}: {type(e).__name__}")
+    log("settings restored")
+
+
+def save_settings():
+    """At the hand-off: what was chosen in this greeter becomes the default next time (hidden volume only)."""
+    if vault_kind != "hidden":
+        return
+    s = {"mac_random": state["mac_random"], "bridges": state["bridges"], "restricted": state["restricted"],
+         "unsafe": state["unsafe"], "session": state["session"], "apps": state["apps"],
+         "password_hash": shadow_hash()}
+    if state["mode"] in MODES - {"direct"}:
+        s["mode"] = state["mode"]
+    if vpn_saved:                                       # only accounts that logged in (or were saved before)
+        s["vpn_accounts"] = vpn_saved
+    r = run([VAULT, "settings", "set"], data=json.dumps(s))
+    log("settings saved" if r.returncode == 0 else "settings not saved")
+
+
+def shadow_hash():
+    try:
+        with open("/etc/shadow") as f:
+            for line in f:
+                name, pw = line.split(":", 2)[:2]
+                if name == USER and pw and not pw.startswith(("!", "*")):
+                    return pw
+    except OSError:
+        pass
+    return None
+
+
+FLAG = "/run/lacuna-password-set"       # world-readable: lacuna-lock only locks the screen when a password exists
+
+
+def publish_password_flag():
+    if password_is_set():
+        with open(FLAG, "w") as f:
+            f.write("1\n")
+        os.chmod(FLAG, 0o644)
+    else:
+        try:
+            os.remove(FLAG)
+        except FileNotFoundError:
+            pass
+
+
+def set_password(password):
+    if password is None:
+        run(["passwd", "-l", USER])
+        state["password_set"] = password_is_set()
+        publish_password_flag()
+        return {"ok": True}
+    if len(password) < 4 or "\n" in password or ":" in password:
+        return {"ok": False, "error": "use at least 4 characters (no colon or line break)"}
+    r = run(["chpasswd"], data=f"{USER}:{password}\n")
+    del password
+    state["password_set"] = password_is_set()
+    publish_password_flag()
+    return {"ok": r.returncode == 0, "error": r.stderr.strip() if r.returncode else None}
+
+
+def set_mac(random_on):
+    os.makedirs("/run/NetworkManager/conf.d", exist_ok=True)
+    path = "/run/NetworkManager/conf.d/90-lacuna-mac.conf"
+    if random_on:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    else:
+        with open(path, "w") as f:
+            f.write("[device]\nwifi.scan-rand-mac-address=no\n[connection]\n"
+                    "wifi.cloned-mac-address=permanent\nethernet.cloned-mac-address=permanent\n")
+    run(["nmcli", "general", "reload", "conf"])
+    state["mac_random"] = bool(random_on)
+    return {"ok": True}
+
+
+def saved_networks():
+    r = run(["nmcli", "-t", "-e", "no", "-f", "NAME", "connection", "show"])
+    return {l[len("lacuna-"):] for l in r.stdout.splitlines() if l.startswith("lacuna-")}
+
+
+def wifi_scan():
+    saved = saved_networks()
+    r = run(["nmcli", "-t", "-e", "yes", "-f", "SSID,SIGNAL,SECURITY,IN-USE", "dev", "wifi", "list", "--rescan", "yes"])
+    seen, nets = set(), []
+    for line in r.stdout.splitlines():
+        parts, cur, esc = [], "", False
+        for ch in line:                 # nmcli -t escapes ':' and '\' with a backslash
+            if esc:
+                cur += ch; esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == ":":
+                parts.append(cur); cur = ""
+            else:
+                cur += ch
+        parts.append(cur)
+        if len(parts) < 4 or not parts[0] or parts[0] in seen:
+            continue
+        seen.add(parts[0])
+        nets.append({"ssid": parts[0], "signal": int(parts[1] or 0), "security": parts[2], "active": parts[3] == "*",
+                     "saved": parts[0] in saved})
+    nets.sort(key=lambda n: -n["signal"])
+    return {"ok": True, "networks": nets[:40]}
+
+
+def wifi_connect(ssid, password):
+    if not ssid or len(ssid) > 64:
+        return {"ok": False, "error": "bad network name"}
+    name = "lacuna-" + ssid
+    if not password and ssid in saved_networks():      # saved in the vault: its key is already there
+        r = run(["nmcli", "--wait", "40", "connection", "up", "id", name], timeout=60)
+        return {"ok": True} if r.returncode == 0 else {"ok": False, "error": "could not connect (out of range?)"}
+    run(["nmcli", "connection", "delete", "id", name])
+    add = ["nmcli", "connection", "add", "type", "wifi", "con-name", name, "ssid", ssid,
+           "connection.autoconnect", "no"]
+    if password:
+        add += ["wifi-sec.key-mgmt", "wpa-psk"]
+    r = run(add)
+    if r.returncode != 0:
+        return {"ok": False, "error": r.stderr.strip() or "could not create the connection"}
+    up = ["nmcli", "--wait", "40", "connection", "up", "id", name]
+    data = None
+    if password:
+        up += ["passwd-file", "/dev/stdin"]            # the key travels through a pipe, never through argv
+        data = f"802-11-wireless-security.psk:{password}\n"
+    r = run(up, data=data, timeout=60)
+    del password, data
+    if r.returncode != 0:
+        run(["nmcli", "connection", "delete", "id", name])
+        return {"ok": False, "error": "could not connect (wrong key, or out of range)"}
+    return {"ok": True}
+
+
+def apply_gate(mode):
+    global vpn_new
+    gate_job.update(mode=mode, running=True, error=None)
+    r = run([GATE, "apply", mode], timeout=180)
+    err = None
+    if r.returncode:
+        lines = [l for l in r.stderr.strip().splitlines() if l.startswith("gate: ") and " login: " not in l]
+        err = (lines or r.stderr.strip().splitlines() or ["gate failed"])[-1].removeprefix("gate: ")
+    gate_job.update(running=False, error=err)
+    log(f"gate {mode}: {'ok' if r.returncode == 0 else 'failed'}")
+    if r.returncode == 0:
+        if vpn_new and mode.removeprefix("tor+") == vpn_new[0]:
+            vpn_saved[vpn_new[0]] = vpn_new[1]          # it logged in: keep it (and save it, below)
+            vpn_new = None
+        try:
+            save_settings()                             # the working choice is the default next time
+        except Exception as e:
+            log(f"save: {type(e).__name__}")
+
+
+def account_ok(vpn, a):
+    vals = [str(a.get(k, "")) for k in (("username", "password") if vpn == "pia" else ("account",))]
+    return all(vals) and not any("\n" in v or len(v) > 200 for v in vals)
+
+
+def set_mode(mode, bridges, vpn_account, restricted=False):
+    global vpn_new
+    if state["session"] == "opsec":
+        mode = {"tor": "tor-socks"}.get(mode, mode)     # the opsec session's Tor: SOCKS only, nothing redirected
+        if mode not in OPSEC_MODES and not (mode == "direct" and DIRECT_OK):
+            return {"ok": False, "error": "the opsec session is Tor only (no VPN)"}
+    if mode not in MODES or (mode == "direct" and not DIRECT_OK):
+        return {"ok": False, "error": "unknown mode"}
+    if gate_job["running"]:
+        return {"ok": False, "error": "still applying the previous choice"}
+    os.makedirs("/run/lacuna", mode=0o700, exist_ok=True)
+    lines = [b.strip() for b in (bridges or []) if isinstance(b, str) and b.strip()][:20]
+    if any("\n" in l for l in lines):
+        return {"ok": False, "error": "bad bridge line"}
+    with open("/run/lacuna/bridges", "w") as f:
+        f.write("".join(l + "\n" for l in lines))
+    if restricted:
+        open("/run/lacuna/restricted", "w").close()
+    else:
+        try:
+            os.remove("/run/lacuna/restricted")
+        except FileNotFoundError:
+            pass
+    vpn = mode.removeprefix("tor+")
+    if vpn in VPNS:
+        typed = isinstance(vpn_account, dict) and any(vpn_account.values())
+        a = vpn_account if typed else vpn_saved.get(vpn)
+        if not a or not account_ok(vpn, a):
+            return {"ok": False, "error": {"pia": "PIA needs a username and a password",
+                                           "mullvad": "Mullvad needs the account number",
+                                           "ivpn": "IVPN needs the account ID"}[vpn]}
+        a = {k: str(a[k]) for k in ("username", "password", "account") if a.get(k)}
+        fd = os.open(CREDS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{a['username']}\n{a['password']}\n" if vpn == "pia" else f"{a['account']}\n")
+        if typed:
+            vpn_new = (vpn, a)
+        del a
+    del vpn_account
+    state["mode"] = mode
+    state["bridges"] = lines
+    state["restricted"] = bool(restricted)
+    threading.Thread(target=apply_gate, args=(mode,), daemon=True).start()
+    return {"ok": True}
+
+
+def gate_status():
+    try:
+        st = json.loads(run([GATE, "status", gate_job["mode"] or ""], timeout=10).stdout)
+    except (ValueError, subprocess.SubprocessError):
+        st = {}
+    return {"ok": True, "applying": gate_job["running"], "wanted": gate_job["mode"], "error": gate_job["error"], **st}
+
+
+def finish():
+    if state["mode"] is None:
+        return {"ok": False, "error": "choose a network mode first"}
+    if gate_job["error"]:
+        return {"ok": False, "error": "the network mode failed: " + gate_job["error"]}
+    os.makedirs("/run/lacuna", mode=0o700, exist_ok=True)
+    with open(LOGIN_FLAG, "w") as f:                          # consumed by the hand-off login (pam_exec)
+        f.write(str(time.time()))
+    os.chmod(LOGIN_FLAG, 0o600)
+    try:
+        save_settings()
+    except Exception as e:
+        log(f"save: {type(e).__name__}")
+    state["handed_off"] = True
+    log("hand-off allowed")
+    return {"ok": True}
+
+
+def set_unsafe(on):
+    os.makedirs("/run/lacuna", mode=0o700, exist_ok=True)
+    if on and state["session"] == "opsec":
+        return {"ok": False, "error": "the opsec session has no Unsafe Browser"}
+    if on:
+        open(UNSAFE, "w").close()
+    else:
+        try:
+            os.remove(UNSAFE)
+        except FileNotFoundError:
+            pass
+        run(["systemctl", "stop", "lacuna-unsafe-browser-*"])     # turned off: close it too
+    state["unsafe"] = bool(on)
+    if state["mode"] and not gate_job["running"]:
+        run([GATE, "refresh"], timeout=30)                       # only the rules: Tor/PIA keep running
+    log(f"unsafe browser {'allowed' if on else 'off'}")
+    return {"ok": True}
+
+
+def launch(app, wayland, url):
+    if app not in ("tor-browser", "unsafe-browser"):
+        return {"ok": False, "error": "unknown app"}
+    if app == "unsafe-browser" and not state["unsafe"]:
+        return {"ok": False, "error": "the Unsafe Browser is off: switch it on in Lacuna Settings or the greeter"}
+    r = run([APPBOX, app, str(wayland), str(url or "")], timeout=120)
+    return {"ok": r.returncode == 0, "error": (r.stderr.strip().splitlines() or ["appbox failed"])[-1]
+            if r.returncode else None}
+
+
+def set_session(session):
+    if session not in ("normal", "opsec"):
+        return {"ok": False, "error": "unknown session"}
+    state["session"] = session
+    if session == "opsec":
+        set_unsafe(False)                               # never in the opsec session
+    log(f"session {session}")
+    return {"ok": True}
+
+
+def set_apps(apps):
+    apps = [a for a in (apps or []) if isinstance(a, str) and a in OPSEC_APPS]
+    with open(OPSEC_APPS_FILE, "w") as f:
+        f.write("".join(a + "\n" for a in apps))
+    os.chmod(OPSEC_APPS_FILE, 0o644)                    # read by the session script (as the live user)
+    state["apps"] = apps
+    return {"ok": True}
+
+
+def stick():
+    """Stickless: is the boot stick still plugged in? (unknown counts as gone: never trap anyone on this screen)"""
+    try:
+        name = open("/run/lacuna/boot-disk").read().strip()
+    except OSError:
+        return {"ok": True, "present": False}
+    return {"ok": True, "present": bool(name) and os.path.exists(f"/sys/block/{name}")}
+
+
+def features():
+    if vault_kind != "hidden":
+        return {"ok": True, "available": False, "features": []}
+    r = run([VAULT, "features", "--json"])
+    try:
+        return {"ok": True, "available": True, "features": json.loads(r.stdout)}
+    except ValueError:
+        return {"ok": False, "error": "vault: " + (r.stderr.strip() or "no answer")}
+
+
+def set_feature(name, on):
+    if vault_kind != "hidden":
+        return {"ok": False, "error": "the persistence isn't unlocked"}
+    if not isinstance(name, str) or not name.isalnum():
+        return {"ok": False, "error": "unknown feature"}
+    r = run([VAULT, "features", "enable" if on else "disable", name])
+    return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+
+
+def handle(req, session=False):
+    op = req.get("op")
+    log(f"op {op}" + (" (session)" if session else ""))
+    if session and op not in SESSION_OPS:
+        return {"ok": False, "error": "not allowed from the session"}
+    if session and op == "set_password" and password_is_set():
+        # from an unlocked session that would be a way to root without knowing the password
+        return {"ok": False, "error": "a password is already set; it can only be changed at the next start"}
+    if op == "state":
+        with lock:
+            return {"ok": True, **state, "password_set": password_is_set(), "gate_ready": GATE_READY,
+                    "stickless": STICKLESS, "direct_allowed": DIRECT_OK, "vpn_saved": sorted(vpn_saved), "opsec_apps": list(OPSEC_APPS),
+                    "persistence": state["vault"] == "unlocked", "writable": vault_kind == "hidden"}
+    if op == "unlock":
+        if STICKLESS:                                   # no stick, no vault: nothing to try
+            return {"ok": True, "result": "none"}
+        return unlock(str(req.get("passphrase", "")))
+    if op == "set_password":
+        pw = req.get("password")
+        return set_password(None if pw is None else str(pw))
+    if op == "set_mac":
+        return set_mac(bool(req.get("random", True)))
+    if op == "wifi_scan":
+        return wifi_scan()
+    if op == "wifi_connect":
+        pw = req.get("password")
+        return wifi_connect(str(req.get("ssid", "")), None if not pw else str(pw))
+    if op == "set_mode":
+        return set_mode(str(req.get("mode", "")), req.get("bridges"), req.get("vpn") or req.get("pia"),
+                        req.get("restricted") is True)
+    if op == "gate_status":
+        return gate_status()
+    if op == "finish":
+        return finish()
+    if op == "stick":
+        return stick()
+    if op == "set_session":
+        return set_session(str(req.get("session", "")))
+    if op == "set_apps":
+        return set_apps(req.get("apps"))
+    if op == "leaktest":                                # milestone 4's acceptance check, from Lacuna Settings
+        r = run(["/usr/local/bin/leaktest"] + (["--inject"] if req.get("inject") is True else []), timeout=400)
+        return {"ok": True, "passed": r.returncode == 0, "output": (r.stdout + r.stderr)[-6000:]}
+    if op == "set_unsafe":
+        return set_unsafe(req.get("on") is True)
+    if op == "launch":
+        return launch(req.get("app"), req.get("wayland", ""), req.get("url", ""))
+    if op == "features":
+        return features()
+    if op == "set_feature":
+        return set_feature(req.get("name"), req.get("on") is True)
+    return {"ok": False, "error": "unknown request"}
+
+
+def serve(conn, greeter_uid, session_uid):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    pid, uid, gid = struct.unpack("3i", creds)
+    if uid not in (greeter_uid, session_uid):
+        log(f"refused uid {uid}")
+        conn.close(); return
+    session = uid != greeter_uid
+    f = conn.makefile("rwb", buffering=0)
+    for raw in f:
+        try:
+            req = json.loads(raw)
+            reply = handle(req, session) if isinstance(req, dict) else {"ok": False, "error": "bad request"}
+        except Exception as e:                          # never echo the request (it may hold a secret)
+            log(f"error {type(e).__name__}: {e}")
+            reply = {"ok": False, "error": f"greeterd: {type(e).__name__}"}
+        finally:
+            req = raw = None
+        f.write((json.dumps(reply) + "\n").encode())
+    conn.close()
+
+
+def main():
+    greeter = pwd.getpwnam("greeter")
+    session_uid = pwd.getpwnam(USER).pw_uid
+    os.makedirs("/run/lacuna", mode=0o700, exist_ok=True)
+    os.makedirs("/run/greeterd", exist_ok=True)
+    # reachable by everyone; serve() lets only the greeter (everything) and the live user (SESSION_OPS) in
+    os.chown("/run/greeterd", 0, 0)
+    os.chmod("/run/greeterd", 0o755)
+    try:
+        os.remove(SOCK)
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(LOGIN_FLAG)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(SOCK)
+    os.chown(SOCK, 0, 0)
+    os.chmod(SOCK, 0o666)
+    s.listen(4)
+    state["password_set"] = password_is_set()
+    publish_password_flag()
+    log("ready")
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=serve, args=(conn, greeter.pw_uid, session_uid), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

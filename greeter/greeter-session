@@ -1,0 +1,7 @@
+#!/bin/sh
+# greetd runs this as `greeter`: a bare niri with the greeter config (no systemd user session needed).
+export XDG_CURRENT_DESKTOP=niri
+# the greeter user's home is / (not writable): caches (awww's wallpaper cache, fontconfig) go to its runtime dir
+export XDG_CACHE_HOME="${XDG_RUNTIME_DIR:-/tmp}/cache"
+mkdir -p "$XDG_CACHE_HOME"
+exec niri -c /usr/share/lacuna/greeter/niri.kdl

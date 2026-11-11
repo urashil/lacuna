@@ -1,0 +1,44 @@
+// Greeter session: the blurred wallpaper and one see-through foot running lacuna-greeter. Nothing else to launch.
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+        numlock
+    }
+    touchpad {
+        tap
+        natural-scroll
+    }
+}
+prefer-no-csd
+hotkey-overlay {
+    skip-at-startup
+}
+screenshot-path null
+cursor {
+    xcursor-theme "capitaine-cursors"
+    xcursor-size 24
+}
+layout {
+    gaps 0
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+}
+animations {
+    off
+}
+window-rule {
+    match app-id="^lacuna-greeter$"
+    open-maximized true
+}
+spawn-sh-at-startup "awww-daemon >/dev/null 2>&1 & sleep 0.4; awww img --transition-type none /usr/share/lacuna/greeter/wallpaper.png"
+// the TUI in a loop: if it ever exits or crashes it comes straight back (a crash stays readable until Enter)
+spawn-at-startup "/usr/local/lib/lacuna/greeter-loop"
+binds {
+    // no launcher, no terminal, no escape hatches in the greeter
+}

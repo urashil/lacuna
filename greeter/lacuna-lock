@@ -1,0 +1,22 @@
+#!/bin/sh
+# lacuna-lock [idle|resume]: lock the screen, but only if a password exists (set in the greeter, or restored from
+# the vault). Without one a locked screen could never be unlocked, so: say so, and on idle just turn the screens
+# off. That idle state is marked ($XDG_RUNTIME_DIR/lacuna-idle) so the reaper counts it like a lock; swayidle's
+# resume (any input) clears the mark.
+mark="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lacuna-idle"
+case "${1:-}" in
+    resume) rm -f "$mark"; exit 0 ;;
+esac
+if [ -e /run/lacuna-password-set ]; then
+    # the opsec session has no caelestia shell: swaylock there (the reaper counts it as locked too)
+    if [ "${LACUNA_SESSION:-}" = opsec ] || ! pgrep -x -u "$(id -u)" qs >/dev/null 2>&1; then
+        exec swaylock -f -c 111318
+    fi
+    exec caelestia shell lock lock
+fi
+if [ "${1:-}" = idle ]; then
+    [ -e "$mark" ] || date +%s > "$mark"
+    exec niri msg action power-off-monitors
+fi
+notify-send -a Lacuna -i system-lock-screen "Screen not locked" \
+    "No password was set when Lacuna started, so a locked screen could never be unlocked. Set one in Lacuna Settings or the greeter's options to use the lock screen."

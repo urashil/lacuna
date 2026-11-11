@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# reaper: locked (or nobody signed in) for 6 hours -> wipe and power off (PLAN section 7; the rice-lockclock idea).
+# The clock runs while
+#   - nobody has started the session yet (the greeter, from boot on),
+#   - the session is locked (caelestia's lock, or swaylock), or
+#   - no password is set and the screens were blanked for being idle (lacuna-lock marks that; any input clears it).
+# Being in the session and unlocked stops and resets it. Nothing holds it off (no caffeine in Lacuna).
+# It fires by creating /run/lacuna/reap: stickwatch's watcher, outside the slices wipe freezes, runs the wipe.
+#   reaper watch     the service: check every 20 s
+#   reaper status    the clock and the time left
+# Testing: lacuna.reaper=SECONDS on the kernel command line replaces the 6 hours.
+set -u
+SINCE=/run/lacuna-reaper-since          # world-readable: the clock is not a secret
+USER_=amnesia
+LIMIT=$(sed -n 's/.*lacuna\.reaper=\([0-9][0-9]*\).*/\1/p' /proc/cmdline)
+LIMIT=${LIMIT:-21600}
+
+away() {   # 0 = the clock should run
+    local uid; uid=$(id -u "$USER_")
+    # no graphical session of the live user: greeter (or nothing) on screen
+    loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER_" '$3 == u' | grep -q . || return 0
+    pgrep -u "$USER_" -x swaylock >/dev/null && return 0
+    [[ -e /run/user/$uid/lacuna-idle ]] && return 0
+    # setpriv, not runuser: runuser opens a PAM session (and a logind session) every time, which every 20 s kept
+    # systemd and logind busy enough to stall systemctl and sudo for a minute at a time
+    [[ $(timeout 5 setpriv --reuid="$uid" --regid="$(id -g "$USER_")" --init-groups \
+           env HOME="/home/$USER_" XDG_RUNTIME_DIR="/run/user/$uid" \
+           caelestia shell lock isLocked 2>/dev/null) == true ]] && return 0
+    return 1
+}
+
+case ${1:-status} in
+    watch)
+        echo "reaper: fires after $((LIMIT / 60)) min locked or away"
+        while :; do
+            now=$(date +%s)
+            if away; then
+                [[ -s $SINCE ]] || { echo "$now" > "$SINCE"; chmod 644 "$SINCE"; }
+                if (( now - $(cat "$SINCE") >= LIMIT )); then
+                    away || { rm -f "$SINCE"; continue; }       # once more, right before: never while in use
+                    echo "reaper: away for $(( (now - $(cat "$SINCE")) / 60 )) min: wipe and power off"
+                    touch /run/lacuna/reap
+                    sleep 30
+                    # the watcher should have taken over by now; if it is not running, power off anyway
+                    systemctl poweroff -i
+                fi
+            else
+                rm -f "$SINCE"
+            fi
+            sleep 20
+        done ;;
+    status)
+        if [[ -s $SINCE ]]; then
+            left=$(( $(cat "$SINCE") + LIMIT - $(date +%s) ))
+            echo "locked or away for $(( ($(date +%s) - $(cat "$SINCE")) / 60 )) min: wipe and power off in $(( left / 60 )) min"
+        else
+            echo "in use: the clock is stopped (it fires after $((LIMIT / 60)) min locked or away)"
+        fi ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

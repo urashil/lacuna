@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Persistence
+GenericName=Encrypted persistent storage
+Comment=Create the deniable persistence on this stick, choose what is kept
+Exec=foot -T Persistence sh -c 'sudo /usr/local/bin/vault; echo; read -r -p "Press Enter to close. " _'
+Icon=drive-harddisk
+Categories=System;Security;
+Terminal=false

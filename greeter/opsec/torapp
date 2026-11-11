@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# torapp NAME [args]: start an app of the opsec session through its own Tor SOCKS port.
+# Tor never puts streams from different SocksPorts on the same circuit, so each app gets circuits (and exits) of its
+# own: what one app does can't be linked to another's traffic by a shared circuit. (An app you log into still knows
+# it's you: isolation keeps that identity from spilling onto the rest, it doesn't hide it from that service.)
+# In the opsec session the firewall lets only Tor itself out (gate mode tor-socks), so an app that ignores its proxy
+# simply has no network: nothing leaks around Tor.
+#   torapp --list     the apps, their desktop entries and ports
+set -u
+# name | desktop entry | how the proxy is applied | SOCKS port (9160-9179: one per app; 9150 is Tor Browser's)
+APPS='
+thunderbird|org.mozilla.Thunderbird.desktop|torsocks|9160
+signal|signal.desktop|chromium|9161
+element|io.element.Element.desktop|chromium|9162
+electrum|electrum.desktop|electrum|9163
+monero|org.getmonero.Monero.desktop|torsocks|9164
+simplex|simplex.desktop|torsocks|9165
+spotify|spotify-launcher.desktop|torsocks|9166
+mpv|mpv.desktop|none|-
+'
+[ "${1:-}" = --list ] && { printf '%s\n' "$APPS" | grep .; exit 0; }
+name=${1:?usage: torapp NAME [args]}; shift
+line=$(printf '%s\n' "$APPS" | grep "^$name|") || { echo "torapp: unknown app $name" >&2; exit 2; }
+IFS='|' read -r _ desktop method port <<<"$line"
+exec_line=$(grep -m1 '^Exec=' "/usr/share/applications/$desktop" | cut -d= -f2-) ||
+    { echo "torapp: $desktop not installed" >&2; exit 1; }
+# the desktop entry's command without its field codes (%u, %F, ...)
+read -r -a cmd <<<"$(printf '%s' "$exec_line" | sed -E 's/ ?%[a-zA-Z]//g')"
+case $method in
+    torsocks) exec torsocks --port "$port" --isolate "${cmd[@]}" "$@" ;;
+    chromium) # Chromium/Electron: SOCKS for everything, and no DNS of its own (names resolve through the proxy)
+              exec "${cmd[@]}" --proxy-server="socks5://127.0.0.1:$port" \
+                   --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1" "$@" ;;
+    electrum) exec "${cmd[@]}" --proxy "socks5:127.0.0.1:$port" "$@" ;;
+    none)     exec "${cmd[@]}" "$@" ;;
+esac

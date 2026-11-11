@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""lacuna-greeter: the pre-session screens (PLAN section 3), a Textual TUI run as the unprivileged `greeter` user in
+a fullscreen foot inside the greeter's niri session.
+
+  1 persistence passphrase  2 options (MAC, admin password)  3 Wi-Fi / Ethernet  4 network mode + bridges  5 start
+
+Everything privileged goes through greeterd (/run/greeterd/greeterd.sock); the hand-off to the real session goes
+through greetd's own socket ($GREETD_SOCK)."""
+import json, os, socket, struct, subprocess, sys, time
+
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.theme import Theme
+from textual.binding import Binding
+from textual.widgets import (Button, Footer, Input, Label, ListItem, ListView, LoadingIndicator, RadioButton,
+                             RadioSet, Static, Switch, TextArea)
+
+DAEMON = "/run/greeterd/greeterd.sock"
+PALETTE = "/usr/share/lacuna/greeter/colors.json"
+USER = "amnesia"
+
+
+# ---------- the two sockets ----------
+def daemon(op, _timeout=120, **kw):
+    """One request to greeterd. A fresh connection each time, so nothing secret lingers in a buffer."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(_timeout)
+        s.connect(DAEMON)
+        s.sendall((json.dumps({"op": op, **kw}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf or b'{"ok": false, "error": "no answer from greeterd"}')
+    except OSError as e:
+        return {"ok": False, "error": f"greeterd: {e.strerror or e}"}
+    finally:
+        s.close()
+
+
+def greetd(msg):
+    """greetd IPC: native-endian u32 length + JSON."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(os.environ["GREETD_SOCK"])
+    data = json.dumps(msg).encode()
+    s.sendall(struct.pack("=I", len(data)) + data)
+    n = struct.unpack("=I", s.recv(4))[0]
+    reply = b""
+    while len(reply) < n:
+        reply += s.recv(n - len(reply))
+    s.close()
+    return json.loads(reply)
+
+
+def start_session(session="normal"):
+    r = greetd({"type": "create_session", "username": USER})
+    if r.get("type") == "auth_message":                     # the PAM gate should have let us straight through
+        greetd({"type": "cancel_session"})
+        return "the login was refused (greeterd did not allow the hand-off)"
+    if r.get("type") != "success":
+        return r.get("description") or "greetd refused the session"
+    cmd = ["/usr/local/bin/lacuna-opsec-session"] if session == "opsec" else ["niri-session"]
+    r = greetd({"type": "start_session", "cmd": cmd, "env": []})
+    if r.get("type") != "success":
+        return r.get("description") or "greetd could not start the session"
+    subprocess.Popen(["niri", "msg", "action", "quit", "--skip-confirmation"])   # greetd starts it when we exit
+    return None
+
+
+# ---------- screens ----------
+class Step(Screen):
+    """Every screen works from the keyboard alone: Tab/Shift+Tab move, Enter acts, Esc goes back, Ctrl+N continues."""
+    TITLE = ""
+    HINT = ""
+    BINDINGS = [Binding("escape", "back", "Back"), Binding("ctrl+n", "next", "Continue", priority=True)]
+
+    def action_back(self):
+        if len(self.app.screen_stack) > 2:
+            self.app.pop_screen()
+
+    def action_next(self):
+        self.go()
+
+    def back(self):
+        self.action_back()
+
+    def head(self) -> ComposeResult:
+        yield Label("lacuna", id="brand")
+        yield Label(self.TITLE, classes="title")
+        if self.HINT:
+            yield Label(self.HINT, classes="hint")
+
+    def fit_body(self):
+        """The scrolling middle gets exactly the rows the title, buttons and messages leave free, so it never
+        pushes them off the screen (and nested scrolling, which doesn't follow the focus well, isn't needed)."""
+        try:
+            body = self.query_one(".body")
+            card = self.query_one(".card")
+        except Exception:
+            return
+        rest = sum(w.outer_size.height for w in body.parent.children if w is not body and w.display)
+        chrome = card.styles.padding.top + card.styles.padding.bottom + 2          # padding + round border
+        free = self.size.height - 1 - chrome - rest                                # 1: the footer
+        body.styles.max_height = max(3, free)
+
+    def on_resize(self, event):
+        self.call_after_refresh(self.fit_body)
+
+    def on_screen_resume(self, event=None):
+        self.call_after_refresh(self.fit_body)
+
+    def say(self, text, error=False):
+        msg = self.query_one("#msg", Label)
+        msg.update(text)
+        msg.set_class(error, "error")
+
+
+class Passphrase(Step):
+    # the first screen: nothing to go back to, so no "Back" in the footer
+    BINDINGS = [Binding("escape", "back", "Back", show=False), Binding("ctrl+n", "next", "Continue", priority=True)]
+    TITLE = "Persistent storage"
+    HINT = "Type your passphrase, or leave it empty to start without persistence."
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield Input(password=True, placeholder="passphrase", id="pass")
+                with Horizontal(classes="buttons"):
+                    yield Button("Continue", variant="primary", id="go")
+                yield LoadingIndicator(id="busy")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#busy").display = False
+        self.query_one("#pass", Input).focus()
+
+    @on(Input.Submitted, "#pass")
+    @on(Button.Pressed, "#go")
+    def go(self):
+        field = self.query_one("#pass", Input)
+        passphrase, field.value = field.value, ""
+        if not passphrase:
+            self.app.persistence = "none"
+            self.app.push_screen(Options())
+            return
+        self.query_one("#busy").display = True
+        self.query_one("#go").disabled = True
+        self.say("Checking… this always takes about 15 seconds.")
+        self.check(passphrase)
+
+    @work(thread=True)
+    def check(self, passphrase):
+        r = daemon("unlock", passphrase=passphrase)
+        del passphrase
+        self.app.call_from_thread(self.checked, r)
+
+    def checked(self, r):
+        self.query_one("#busy").display = False
+        self.query_one("#go").disabled = False
+        if r.get("result") != "unlocked":
+            # one message for "wrong passphrase" and "no vault": they must stay indistinguishable
+            self.say("No persistence opened: wrong passphrase, or none on this stick. Try again, or leave it "
+                     "empty to start without.", error=True)
+            self.query_one("#pass", Input).focus()
+            return
+        self.app.persistence = "unlocked"
+        self.app.push_screen(Options())
+
+
+class RemoveStick(Step):
+    """Stickless: everything is in RAM; nothing goes on until the stick is out (then pulling it can't be forgotten)."""
+    BINDINGS = []
+    TITLE = "Remove the USB stick"
+    HINT = "Lacuna is running entirely from RAM. Pull the stick out now; this continues by itself once it's gone."
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield LoadingIndicator(id="busy")
+                yield Label("Waiting for the stick to be removed…", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.set_interval(0.5, self.poll)
+
+    @work(thread=True, exclusive=True)
+    def poll(self):
+        r = daemon("stick")
+        if r.get("ok") and not r.get("present"):
+            self.app.call_from_thread(self.gone)
+
+    def gone(self):
+        if self.app.screen is self:
+            self.app.switch_screen(Options())
+
+    def go(self):                                       # Ctrl+N / Esc do nothing here: the stick has to come out
+        pass
+
+    def action_back(self):
+        pass
+
+
+class Options(Step):
+    TITLE = "Options"
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                with VerticalScroll(classes="body"):
+                    yield Label({"unlocked": "Persistence: unlocked",
+                                 "stickless": "Stickless: running from RAM, no persistence. The USB stick can be removed."}
+                                .get(self.app.persistence, "Persistence: not in use"), classes="hint")
+                    yield Label("Session", classes="sub")
+                    with RadioSet(id="session"):
+                        yield RadioButton("Normal: the full desktop (niri + caelestia), every app and network mode",
+                                          value=True, name="normal")
+                        yield RadioButton("Opsec: a minimal floating desktop (labwc). Tor only, each app on its own "
+                                          "circuits; no VPN, no Unsafe Browser; only Tor Browser, a terminal, files "
+                                          "and KeePassXC unless you add apps", name="opsec")
+                    with Horizontal(classes="row"):
+                        yield Switch(value=True, id="mac")
+                        yield Label("Random network hardware address (MAC)  [recommended]")
+                    with Horizontal(classes="row", id="unsaferow"):
+                        yield Switch(value=False, id="unsafe")
+                        yield Label("Unsafe Browser: for Wi-Fi sign-in pages (hotels, cafés). NOT anonymous")
+                    yield Label("Admin and screen-lock password", classes="sub")
+                    yield Label("Optional. Without one there is no sudo, and the screen can't be locked.", classes="hint")
+                    yield Input(password=True, placeholder="password (empty: none)", id="pw1")
+                    yield Input(password=True, placeholder="again", id="pw2")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Continue", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        st = daemon("state")
+        self.query_one("#mac", Switch).value = st.get("mac_random", True)
+        self.query_one("#unsafe", Switch).value = bool(st.get("saved_unsafe") or st.get("unsafe"))
+        if (st.get("saved_session") or st.get("session")) == "opsec":
+            self.query_one("#session").query(RadioButton)[1].value = True
+        self.session_changed()
+        if st.get("password_set"):
+            self.query_one("#pw1", Input).placeholder = "a password is set (restored); type to replace it"
+        self.query_one("#pw1", Input).focus()          # the MAC switch is one Shift+Tab away
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(RadioSet.Changed, "#session")
+    def session_changed(self, *_):
+        b = self.query_one("#session", RadioSet).pressed_button
+        self.query_one("#unsaferow").display = not (b and b.name == "opsec")
+
+    @on(Input.Submitted, "#pw1")
+    def next_field(self):
+        self.query_one("#pw2", Input).focus()
+
+    @on(Input.Submitted, "#pw2")
+    @on(Button.Pressed, "#go")
+    def go(self):
+        b = self.query_one("#session", RadioSet).pressed_button
+        self.app.session = b.name if b else "normal"
+        r = daemon("set_session", session=self.app.session)
+        if not r.get("ok"):
+            self.say(r.get("error") or "could not set the session", error=True); return
+        a, b = self.query_one("#pw1", Input), self.query_one("#pw2", Input)
+        if a.value != b.value:
+            self.say("The two passwords don't match.", error=True); return
+        pw = a.value or None
+        a.value = b.value = ""
+        r = daemon("set_mac", random=self.query_one("#mac", Switch).value)
+        daemon("set_unsafe", on=self.query_one("#unsafe", Switch).value and self.app.session != "opsec")
+        if pw is not None or not daemon("state").get("password_set"):
+            r = daemon("set_password", password=pw)
+            del pw
+            if not r.get("ok"):
+                self.say(r.get("error") or "could not set the password", error=True); return
+        self.app.push_screen(Network())
+
+
+class Network(Step):
+    TITLE = "Network"
+    HINT = "Arrows + Enter to join a Wi-Fi network, or Ctrl+N to continue (Ethernet connects by itself)."
+    BINDINGS = Step.BINDINGS + [Binding("ctrl+r", "rescan", "Rescan")]
+
+    def action_rescan(self):
+        self.scan()
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield ListView(id="nets")
+                yield Input(password=True, placeholder="Wi-Fi key for the selected network", id="key")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Rescan", id="scan")
+                    yield Button("Connect", id="connect")
+                    yield Button("Continue", variant="primary", id="go")
+                yield LoadingIndicator(id="busy")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.nets = []
+        self.query_one("#key").display = False
+        self.query_one("#nets").focus()
+        self.scan()
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#scan")
+    def rescan(self):
+        self.scan()
+
+    @work(thread=True, exclusive=True)
+    def scan(self):
+        self.app.call_from_thread(self.busy, True)
+        r = daemon("wifi_scan")
+        self.app.call_from_thread(self.show, r)
+
+    def busy(self, on_):
+        self.query_one("#busy").display = on_
+
+    def show(self, r):
+        self.busy(False)
+        lv = self.query_one("#nets", ListView)
+        lv.clear()
+        self.nets = r.get("networks", [])
+        for n in self.nets:
+            bars = "▂▄▆█"[: max(1, min(4, n["signal"] // 25 + 1))]
+            lock_ = "" if not n["security"] or n["security"] == "--" else "  🔒"
+            mark = "  (connected)" if n["active"] else ("  (saved)" if n.get("saved") else "")
+            lv.append(ListItem(Label(f"{bars:<4} {n['ssid']}{lock_}{mark}")))
+        if not self.nets:
+            self.say("No Wi-Fi networks found." if r.get("ok") else (r.get("error") or "scan failed"), error=not r.get("ok"))
+            self.query_one("#go").focus()
+        elif not isinstance(self.focused, Input):
+            lv.index = 0
+            lv.focus()
+
+    def selected(self):
+        i = self.query_one("#nets", ListView).index
+        return self.nets[i] if i is not None and 0 <= i < len(self.nets) else None
+
+    @on(ListView.Highlighted)
+    def pick(self):
+        n = self.selected()
+        secured = bool(n and n["security"] and n["security"] != "--" and not n.get("saved"))
+        self.query_one("#key").display = secured
+
+    @on(ListView.Selected)
+    @on(Input.Submitted, "#key")
+    @on(Button.Pressed, "#connect")
+    def connect(self):
+        n = self.selected()
+        if not n:
+            self.say("Select a network first.", error=True); return
+        key = self.query_one("#key", Input)
+        secured = n["security"] and n["security"] != "--" and not n.get("saved")
+        if secured and not key.value:
+            key.display = True; key.focus()
+            self.say(f"Key for {n['ssid']}, then Enter.")
+            return
+        password, key.value = key.value or None, ""
+        self.say(f"Connecting to {n['ssid']}…")
+        self.join(n["ssid"], password)
+
+    @work(thread=True, exclusive=True)
+    def join(self, ssid, password):
+        self.app.call_from_thread(self.busy, True)
+        r = daemon("wifi_connect", ssid=ssid, password=password)
+        del password
+        self.app.call_from_thread(self.joined, ssid, r)
+
+    def joined(self, ssid, r):
+        self.busy(False)
+        if r.get("ok"):
+            self.say(f"Connected to {ssid}. Ctrl+N to continue.")
+            self.query_one("#key").display = False
+            self.query_one("#go").focus()
+        else:
+            self.say(r.get("error") or "could not connect", error=True)
+
+    @on(Button.Pressed, "#go")
+    def go(self):
+        self.app.push_screen(Mode())
+
+
+VPN_NAMES = {"pia": "PIA", "mullvad": "Mullvad", "ivpn": "IVPN"}
+
+
+class Mode(Step):
+    TITLE = "How to connect"
+    HINT = "Everything after this screen goes out through the choice made here, or not at all."
+
+    def compose(self) -> ComposeResult:
+        st = daemon("state")
+        self.vpn_saved = set(st.get("vpn_saved") or [])
+        if self.app.settings and st.get("mode"):           # in the session: what is in use now
+            st = {**st, "saved_mode": st["mode"], "saved_bridges": st.get("bridges") or [],
+                  "saved_restricted": st.get("restricted")}
+        saved = st.get("saved_mode") or "tor"              # from persistence, else Tor
+        if saved == "direct" and not st.get("direct_allowed"):
+            saved = "tor"
+        vpn = saved.removeprefix("tor+")
+        self.saved_kind = {"tor": "tor", "offline": "offline", "direct": "direct"}.get(saved) or (
+            "tor+vpn" if saved.startswith("tor+") else "vpn")
+        self.saved_vpn = vpn if vpn in VPN_NAMES else "pia"
+        sb = st.get("saved_bridges") or []
+        kind = "none" if not sb else (sb[0][8:] if len(sb) == 1 and sb[0].startswith("builtin:") else "custom")
+        if kind not in ("none", "obfs4", "snowflake", "meek", "custom"):
+            kind = "none"
+        self.saved_lines = "\n".join(sb) if kind == "custom" else ""
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                with VerticalScroll(classes="body"):
+                    opsec = self.opsec = (st.get("session") or self.app.session) == "opsec"
+                    if opsec and self.saved_kind not in ("tor", "offline", "direct"):
+                        self.saved_kind = "tor"
+                    with RadioSet(id="mode"):
+                        yield RadioButton("Tor" + (" (each app on its own circuits; no other way out)" if opsec else ""),
+                                          value=self.saved_kind == "tor", name="tor")
+                        if not opsec:
+                            yield RadioButton("A VPN (UDP apps such as Spotify work; not anonymous to the VPN)",
+                                              value=self.saved_kind == "vpn", name="vpn")
+                            yield RadioButton("Tor over a VPN (hides Tor use from the local network)",
+                                              value=self.saved_kind == "tor+vpn", name="tor+vpn")
+                        yield RadioButton("Offline", value=self.saved_kind == "offline", name="offline")
+                        if st.get("direct_allowed"):
+                            yield RadioButton("Direct (lacuna.direct: development only, NOT anonymous)",
+                                              value=self.saved_kind == "direct", name="direct")
+                    with Vertical(id="vpnbox"):
+                        yield Label("VPN", classes="sub")
+                        with RadioSet(id="provider"):
+                            for v, n in VPN_NAMES.items():
+                                yield RadioButton(n + ("  (account saved)" if v in self.vpn_saved else ""),
+                                                  value=v == self.saved_vpn, name=v)
+                        with Vertical(id="pia"):
+                            yield Input(placeholder="PIA username (p1234567)", id="pia_user")
+                            yield Input(password=True, placeholder="PIA password", id="pia_pass")
+                        with Vertical(id="acct"):
+                            yield Input(password=True, placeholder="account number", id="account")
+                        yield Label("", id="acct_hint", classes="hint")
+                    with Horizontal(classes="row", id="restrictedrow"):
+                        yield Switch(value=bool(st.get("saved_restricted")), id="restricted")
+                        yield Label("Restricted network: Tor connects only over port 443 (for Wi-Fi that blocks the rest)")
+                    with Vertical(id="tor"):
+                        yield Label("Tor bridges (for networks that block or watch Tor)", classes="sub")
+                        with RadioSet(id="bridges"):
+                            for name, label in (("none", "None"), ("obfs4", "Built-in obfs4"),
+                                                ("snowflake", "Built-in Snowflake"), ("meek", "Built-in meek (via Azure)"),
+                                                ("custom", "Custom bridge lines")):
+                                yield RadioButton(label, value=kind == name, name=name)
+                        yield TextArea(self.saved_lines, id="lines")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Continue", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        pressed = self.query_one("#bridges", RadioSet).pressed_button
+        self.query_one("#lines").display = bool(pressed and pressed.name == "custom")
+        self.refresh_fields()
+        self.query_one("#mode").focus()
+
+    def kind(self):
+        b = self.query_one("#mode", RadioSet).pressed_button
+        return b.name if b else self.saved_kind
+
+    def vpn(self):
+        b = self.query_one("#provider", RadioSet).pressed_button
+        return b.name if b else self.saved_vpn
+
+    def refresh_fields(self):
+        kind, vpn = self.kind(), self.vpn()
+        uses_vpn = kind in ("vpn", "tor+vpn")
+        self.query_one("#vpnbox").display = uses_vpn
+        self.query_one("#pia").display = uses_vpn and vpn == "pia"
+        self.query_one("#acct").display = uses_vpn and vpn != "pia"
+        self.query_one("#account", Input).placeholder = {"mullvad": "Mullvad account number (16 digits)",
+                                                          "ivpn": "IVPN account ID (i-XXXX-XXXX-XXXX)"}.get(vpn, "")
+        self.query_one("#acct_hint", Label).update(
+            "Saved: leave empty to use it, or type a new one." if vpn in self.vpn_saved else "")
+        self.query_one("#tor").display = kind in ("tor", "tor+vpn")
+        self.query_one("#restrictedrow").display = kind in ("tor", "tor+vpn")
+
+    @on(RadioSet.Changed, "#mode")
+    @on(RadioSet.Changed, "#provider")
+    def mode_changed(self, ev):
+        self.refresh_fields()
+
+    @on(RadioSet.Changed, "#bridges")
+    def bridges_changed(self, ev):
+        self.query_one("#lines").display = ev.pressed.name == "custom"
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(Input.Submitted, "#pia_user")
+    def next_field(self):
+        self.query_one("#pia_pass", Input).focus()
+
+    @on(Input.Submitted, "#pia_pass")
+    @on(Input.Submitted, "#account")
+    @on(Button.Pressed, "#go")
+    def go(self):
+        kind, vpn = self.kind(), self.vpn()
+        mode = {"vpn": vpn, "tor+vpn": "tor+" + vpn}.get(kind, kind)
+        bridges = []
+        if kind in ("tor", "tor+vpn"):
+            b = self.query_one("#bridges", RadioSet).pressed_button
+            k = b.name if b else "none"
+            bridges = ([l.strip() for l in self.query_one("#lines", TextArea).text.splitlines() if l.strip()]
+                       if k == "custom" else ([] if k == "none" else [f"builtin:{k}"]))
+        account = None
+        if kind in ("vpn", "tor+vpn"):
+            if vpn == "pia":
+                u, p = self.query_one("#pia_user", Input), self.query_one("#pia_pass", Input)
+                if u.value or p.value or "pia" not in self.vpn_saved:
+                    if not u.value or not p.value:
+                        self.say("PIA needs your username and password.", error=True)
+                        (u if not u.value else p).focus(); return
+                    account = {"username": u.value, "password": p.value}
+                    p.value = ""
+            else:
+                f = self.query_one("#account", Input)
+                if f.value.strip():
+                    account = {"account": f.value.strip().replace(" ", "")}
+                    f.value = ""
+                elif vpn not in self.vpn_saved:
+                    self.say(f"{VPN_NAMES[vpn]} needs your account number.", error=True)
+                    f.focus(); return
+        restricted = self.query_one("#restricted", Switch).value and kind in ("tor", "tor+vpn")
+        if restricted and bridges == ["builtin:snowflake"]:
+            self.say("Snowflake needs UDP, which restricted networks block: use obfs4 or meek.", error=True); return
+        r = daemon("set_mode", mode=mode, bridges=bridges, vpn=account, restricted=restricted)
+        del account
+        if not r.get("ok"):
+            self.say(r.get("error") or "could not set the mode", error=True); return
+        self.app.mode = {"tor": "Tor", "offline": "Offline", "direct": "Direct (NOT anonymous)",
+                         "vpn": VPN_NAMES[vpn], "tor+vpn": f"Tor over {VPN_NAMES[vpn]}"}[kind] + (
+                         ", Tor over port 443" if restricted else "")
+        if self.opsec and not self.app.settings:
+            self.app.push_screen(Apps())
+        else:
+            self.app.push_screen(Start())
+
+
+APP_LABELS = {"thunderbird": "Thunderbird (mail)", "signal": "Signal", "element": "Element (Matrix)",
+              "electrum": "Electrum (Bitcoin)", "monero": "Monero", "simplex": "SimpleX Chat",
+              "spotify": "Spotify (needs UDP: will likely not work over Tor)", "mpv": "mpv (video player, offline)"}
+
+
+class Apps(Step):
+    TITLE = "Apps for this session"
+    HINT = ("Besides Tor Browser, a terminal, files and KeePassXC. Each app you add runs on its own Tor circuits; "
+            "nothing starts by itself. Logging into an app still tells that service it's you.")
+
+    def compose(self) -> ComposeResult:
+        st = daemon("state")
+        on = set(st.get("apps") or st.get("saved_apps") or [])
+        self.names = st.get("opsec_apps") or list(APP_LABELS)
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                with VerticalScroll(classes="body"):
+                    for n in self.names:
+                        with Horizontal(classes="row"):
+                            yield Switch(value=n in on, id=f"a_{n}")
+                            yield Label(APP_LABELS.get(n, n))
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Continue", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        sw = self.query(Switch)
+        (sw.first() if sw else self.query_one("#go")).focus()
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    def go(self):
+        apps = [n for n in self.names if self.query_one(f"#a_{n}", Switch).value]
+        r = daemon("set_apps", apps=apps)
+        if not r.get("ok"):
+            self.say(r.get("error") or "could not set the apps", error=True); return
+        self.app.push_screen(Start())
+
+
+class Start(Step):
+    TITLE = "Ready"
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield Static(f"Persistence: {dict(unlocked='unlocked', stickless='none (stickless)').get(self.app.persistence, 'not in use')}\n"
+                             f"Network: {self.app.mode}\n"
+                             f"Everything else is forgotten at shutdown.", classes="hint")
+                yield Label("", id="net")
+                yield Label("", id="note", classes="hint")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Done" if self.app.settings else "Start Lacuna", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.since = time.monotonic()
+        self.query_one("#go").focus()
+        self.poll()
+        self.set_interval(1.0, self.poll)
+
+    @work(thread=True, exclusive=True)
+    def poll(self):
+        st = daemon("gate_status")
+        self.app.call_from_thread(self.show, st)
+
+    def show(self, st):
+        parts = []
+        wanted = st.get("wanted") or ""
+        vpn = wanted.removeprefix("tor+")
+        vstate = (st.get("vpn_state") or "").lower()
+        if st.get("error"):
+            parts.append(f"Network: failed: {st['error']}")
+        elif vpn in VPN_NAMES:
+            parts.append(f"{VPN_NAMES[vpn]}: connected" if vstate == "connected"
+                         else f"{VPN_NAMES[vpn]}: {st.get('vpn_state') or 'starting'}…")
+        if wanted in ("tor",) or wanted.startswith("tor+"):
+            if not st.get("error"):
+                pct = st.get("tor_bootstrap")
+                parts.append("Tor: connected" if pct == 100 else f"Tor: connecting {pct or 0}%")
+        net = self.query_one("#net", Label)
+        net.update("  ".join(parts))
+        net.set_class(bool(st.get("error")), "error")
+        # stuck at the start of bootstrapping for a minute: say what the transport says, and what to try
+        note = ""
+        pct = st.get("tor_bootstrap") or 0
+        if (wanted == "tor" or wanted.startswith("tor+")) and pct < 15 and time.monotonic() - self.since > 60:
+            note = ("Tor isn't getting through. This network may block it: try other bridges (meek works on "
+                    "almost any network), or the restricted-network option.")
+            if st.get("tor_note"):
+                note += f"\nLast message: {st['tor_note']}"
+        self.query_one("#note", Label).update(note)
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#go")
+    def go(self):
+        if self.app.settings:
+            self.app.pop_screen()                       # back past Mode to the settings menu
+            self.app.pop_screen()
+            return
+        r = daemon("finish")
+        if not r.get("ok"):
+            self.say(r.get("error") or "not ready", error=True); return
+        err = start_session(self.app.session)
+        if err:
+            self.say(err, error=True)
+        else:
+            self.say("Starting…")
+
+
+# ---------- Lacuna Settings (lacuna-greeter --settings, in the session) ----------
+class SettingsHome(Step):
+    BINDINGS = [Binding("escape", "app.quit", "Close")]
+    TITLE = "Lacuna Settings"
+
+    def compose(self) -> ComposeResult:
+        st = daemon("state")
+        self.st = st
+        if not st.get("persistence"):
+            where = "Persistence: not in use. Changes last until shutdown."
+        elif st.get("writable"):
+            where = "Persistence: unlocked. Changes are saved and used at the next start."
+        else:
+            where = "Persistence: ~/Persistent only (no saved settings). Changes here last until shutdown."
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield Label(where, classes="hint")
+                yield Button("Network: mode, bridges, PIA account", id="net")
+                if st.get("session") != "opsec":
+                    with Horizontal(classes="row"):
+                        yield Switch(value=bool(st.get("unsafe")), id="unsafe")
+                        yield Label("Unsafe Browser allowed (Wi-Fi sign-in pages, NOT anonymous)")
+                yield Button("Leak test: check that nothing gets out except the chosen way", id="leak")
+                if st.get("writable"):
+                    yield Button("What the persistence keeps", id="features")
+                if not st.get("password_set"):
+                    yield Button("Set an admin password (none is set)", id="password")
+                with Horizontal(classes="buttons"):
+                    yield Button("Close", variant="primary", id="close")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#net").focus()
+
+    @on(Button.Pressed, "#net")
+    def net(self):
+        self.app.push_screen(Mode())
+
+    @on(Switch.Changed, "#unsafe")
+    def unsafe(self, ev):
+        r = daemon("set_unsafe", on=ev.value)
+        self.say(("Unsafe Browser allowed: it's in the launcher." if ev.value else "Unsafe Browser off (and closed).")
+                 if r.get("ok") else (r.get("error") or "failed"), error=not r.get("ok"))
+
+    @on(Button.Pressed, "#leak")
+    def leak(self):
+        self.app.push_screen(LeakTest())
+
+    @on(Button.Pressed, "#features")
+    def features(self):
+        self.app.push_screen(Features())
+
+    @on(Button.Pressed, "#password")
+    def password(self):
+        self.app.push_screen(Password())
+
+    @on(Button.Pressed, "#close")
+    def close(self):
+        self.app.exit()
+
+    fresh = True
+
+    def on_screen_resume(self, event=None):
+        self.call_after_refresh(self.fit_body)
+        if self.fresh:                                  # the first time it's shown
+            self.fresh = False
+            return
+        self.app.switch_screen(SettingsHome())          # back from a sub-screen: rebuilt, things may have changed
+
+
+class Features(Step):
+    TITLE = "What the persistence keeps"
+    HINT = "Switched on: kept in the hidden part, from now on. Switched off: no longer kept (what was saved stays)."
+
+    def compose(self) -> ComposeResult:
+        r = daemon("features")
+        self.items = r.get("features", [])
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                with VerticalScroll(classes="body"):
+                    for f in self.items:
+                        with Horizontal(classes="row"):
+                            yield Switch(value=f["on"], id=f"f_{f['name']}")
+                            yield Label(f["description"])
+                    if not self.items:
+                        yield Label(r.get("error") or "The persistence isn't unlocked.", classes="warn")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", variant="primary", id="back")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        sw = self.query(Switch)
+        (sw.first() if sw else self.query_one("#back")).focus()
+
+    @on(Switch.Changed)
+    def changed(self, ev):
+        name = ev.switch.id[2:]
+        r = daemon("set_feature", name=name, on=ev.value)
+        self.say(f"{name}: {'kept' if ev.value else 'no longer kept'}" if r.get("ok") else (r.get("error") or "failed"),
+                 error=not r.get("ok"))
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+
+class LeakTest(Step):
+    TITLE = "Leak test"
+    HINT = ("Probes from your user and from root: what the outside sees, IPv6, ping, UDP, DNS, the Unsafe Browser. "
+            "The negative control opens a deliberate hole first: then the test must report a leak.")
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                with VerticalScroll(classes="body"):
+                    yield Static("Not run yet.", id="out")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Negative control", id="inject")
+                    yield Button("Run", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#go").focus()
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#inject")
+    def inject(self):
+        self.start(True)
+
+    def go(self):
+        self.start(False)
+
+    def start(self, inject):
+        self.say("Running… (up to a few minutes over Tor)")
+        self.query_one("#out", Static).update("")
+        self.test(inject)
+
+    @work(thread=True, exclusive=True)
+    def test(self, inject):
+        r = daemon("leaktest", _timeout=450, inject=inject)
+        self.app.call_from_thread(self.show, r, inject)
+
+    def show(self, r, inject):
+        self.query_one("#out", Static).update(r.get("output") or r.get("error") or "no answer")
+        good = r.get("passed")
+        self.say(("Negative control: the injected leak was seen, so the test works." if good else
+                  "Negative control: the injected leak was NOT seen. The checks are blind here.") if inject else
+                 ("No leaks." if good else "LEAK found: see above."), error=not good)
+
+
+class Password(Step):
+    TITLE = "Admin and screen-lock password"
+    HINT = "For sudo and the lock screen. Once set, it can only be changed at the next start."
+
+    def compose(self) -> ComposeResult:
+        with Center(classes="card"):
+            with Vertical():
+                yield from self.head()
+                yield Input(password=True, placeholder="password", id="pw1")
+                yield Input(password=True, placeholder="again", id="pw2")
+                with Horizontal(classes="buttons"):
+                    yield Button("Back", id="back")
+                    yield Button("Set", variant="primary", id="go")
+                yield Label("", id="msg")
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#pw1").focus()
+
+    @on(Input.Submitted, "#pw1")
+    def next_field(self):
+        self.query_one("#pw2", Input).focus()
+
+    @on(Button.Pressed, "#back")
+    def back(self):
+        self.app.pop_screen()
+
+    @on(Input.Submitted, "#pw2")
+    @on(Button.Pressed, "#go")
+    def go(self):
+        a, b = self.query_one("#pw1", Input), self.query_one("#pw2", Input)
+        if not a.value or a.value != b.value:
+            self.say("Type the same password twice.", error=True); return
+        r = daemon("set_password", password=a.value)
+        a.value = b.value = ""
+        if not r.get("ok"):
+            self.say(r.get("error") or "could not set it", error=True); return
+        self.app.pop_screen()
+
+
+class Greeter(App):
+    ENABLE_COMMAND_PALETTE = False                      # no Ctrl+P command palette in a greeter
+    CSS = """
+    /* solid: with a see-through screen the previous screens' cards showed behind the current one */
+    Screen { align: center middle; background: $background; }
+    /* foot fills the pixels left over below the last text row with its see-through background; a solid footer
+       would end above them and leave a strip of wallpaper under it, so the footer is see-through too */
+    Footer { background: transparent; }
+    .card { width: 78; max-width: 95%; height: auto; max-height: 96%; padding: 1 3;
+            background: $surface 85%; border: round $primary 60%; }
+    /* every screen scrolls as a whole when it doesn't fit (small screens, big fonts), on top of the scrolling
+       middle; focus moving with Tab scrolls the focused field into view */
+    .card > Vertical { height: auto; max-height: 100%; overflow-y: auto; scrollbar-size-vertical: 1; }
+    /* the middle of a screen scrolls (focus follows into view); title, buttons and messages always stay visible */
+    .body { height: auto; max-height: 55vh; scrollbar-size-vertical: 1; }
+    #brand { color: $primary; text-style: bold; }
+    .title { text-style: bold; margin: 1 0 0 0; }
+    .sub { text-style: bold; margin: 1 0 0 0; }
+    .hint { color: $text-muted; margin: 0 0 1 0; }
+    .warn { color: $warning; }
+    .row { height: auto; margin: 1 0 0 0; }
+    .row Label { padding: 1 1; width: 1fr; }
+    /* long text wraps instead of being cut off at the card's edge */
+    Label { width: 100%; }
+    .row Label, .buttons Label { width: 1fr; }
+    .buttons { height: auto; margin: 1 0 0 0; align-horizontal: right; }
+    .buttons Button { margin: 0 0 0 1; }
+    #nets { height: 12; max-height: 40vh; border: round $primary 30%; }
+    #lines { height: 5; }
+    #msg { margin: 1 0 0 0; }
+    #msg.error, #net.error { color: $error; }
+    #net { margin: 1 0 0 0; color: $primary; }
+    #pia, #tor, #vpnbox, #acct { height: auto; }
+    /* sections inside a scrolling middle grow with their content (a plain Vertical would take a
+       share of the space instead, and then nothing scrolls) */
+    .body Vertical, .body Horizontal { height: auto; }
+    #busy { height: 1; }
+    """
+
+    persistence = "none"
+    mode = ""
+    session = "normal"
+    settings = False                                    # True: Lacuna Settings in the session, not the greeter
+
+    def on_mount(self):
+        try:
+            c = json.load(open(PALETTE))
+            col = lambda k, d: "#" + c.get(k, d).lstrip("#")
+            self.register_theme(Theme(name="lacuna", primary=col("primary", "#a6c8ff"),
+                                      secondary=col("secondary", "#bdc7dc"), accent=col("tertiary", "#dbbce1"),
+                                      background=col("surface", "#111318"), surface=col("surfaceContainer", "#1d2024"),
+                                      panel=col("surfaceHigh", "#272a2f"), foreground=col("text", "#e2e2e9"),
+                                      error=col("error", "#ffb4ab"), dark=True,
+                                      variables={"footer-background": "transparent",
+                                                 "footer-item-background": "transparent",
+                                                 "footer-description-background": "transparent"}))
+            self.theme = "lacuna"
+        except Exception:
+            self.theme = "textual-dark"
+        if self.settings:
+            self.push_screen(SettingsHome()); return
+        for _ in range(20):                             # greeterd may still be starting
+            st = daemon("state")
+            if st.get("ok"):
+                break
+            time.sleep(0.25)
+        if st.get("stickless"):                         # nothing to unlock: the stick may already be gone
+            self.persistence = "stickless"
+            self.push_screen(RemoveStick())
+        else:
+            self.push_screen(Passphrase())
+
+
+if __name__ == "__main__":
+    app = Greeter()
+    app.settings = "--settings" in sys.argv[1:]
+    app.run()

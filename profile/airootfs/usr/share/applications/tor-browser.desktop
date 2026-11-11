@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Tor Browser
+GenericName=Web Browser
+Comment=Browse the web through Tor
+Exec=/usr/local/bin/tor-browser %u
+Icon=/opt/tor-browser/Browser/browser/chrome/icons/default/default128.png
+Categories=Network;WebBrowser;
+StartupWMClass=Tor Browser

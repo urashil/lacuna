@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# harden: the generic hardening core (PLAN section 1), for an installed Arch system. Each module only changes
+# what it says; nothing runs unless asked. Works on the running system and inside the installer's chroot
+# (there, what needs the running kernel or hardware is set up to happen at the first boot instead).
+USAGE='usage: harden [status]
+       harden apply MODULE...         turn these on (the installer uses this)
+       harden MODULE on|off
+modules:
+  firewall    ufw: deny incoming, allow outgoing
+  sysctl      kernel and network hardening settings (/etc/sysctl.d/60-harden.conf)
+  usb         USBGuard: allow what is plugged in (at the first boot when installing), block new devices
+  dns         DNS over HTTPS (Quad9, DNSSEC, no logs) via dnscrypt-proxy; plain DNS is blocked outside VPN tunnels
+                harden dns portal [min]   let plain DNS through for a Wi-Fi sign-in page (default 5 min)
+  apparmor    AppArmor with the packaged profiles (kernel parameter; images rebuilt)
+  lockdown    kernel lockdown=integrity: even root cannot change the running kernel (blocks unsigned modules)
+  keep        keep the previous 2 kernel images (and their modules) as boot entries
+  secureboot  check | sign | enroll [--microsoft]   own keys with sbctl; enroll needs the firmware in setup mode'
+set -u
+SYSCTL=/etc/sysctl.d/60-harden.conf
+KCMD=/etc/kernel/cmdline
+DOH_CONF=/etc/dnscrypt-proxy/harden-doh.toml
+DOH_ADDR=127.0.0.1:5300
+RESOLVED=/etc/systemd/resolved.conf.d/harden-doh.conf
+GUARD=harden-dns-guard.service
+LIB=/usr/local/lib/harden
+LSM=landlock,lockdown,yama,integrity,apparmor,bpf
+# DoH stamp for https://dns.quad9.net/dns-query at 9.9.9.9 (DNSSEC, no logs)
+STAMP=sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ
+
+say() { printf '==> %s\n' "$*"; }
+die() { printf 'harden: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || [ "${1:-status}" = status ] || exec sudo "$(realpath "$0")" "$@"
+chroot_=0; systemd-detect-virt -q --chroot 2>/dev/null && chroot_=1
+need() { local p; for p in "$@"; do pacman -Q "$p" >/dev/null 2>&1 || pacman -S --needed --noconfirm "$p" >/dev/null || die "could not install $p"; done; }
+enable() { if ((chroot_)); then systemctl enable "$@" >/dev/null 2>&1; else systemctl enable --now "$@" >/dev/null 2>&1; fi; }
+active() { [ "$(systemctl is-active "$1" 2>/dev/null)" = active ]; }
+efivar() { od -An -tu1 -j4 -N1 "/sys/firmware/efi/efivars/$1-8be4df61-93ca-11d2-aa0d-00e098032b8c" 2>/dev/null | tr -d ' '; }
+
+# ---- kernel command line (UKIs: /etc/kernel/cmdline) ----
+kparam() { # kparam name [value]: set, or with no value drop, one parameter
+  [ -f "$KCMD" ] || die "no $KCMD: this system doesn't boot UKIs; add $1${2:+=$2} to its kernel command line yourself"
+  local base; base=$(tr ' ' '\n' < "$KCMD" | grep -v "^$1=" | grep . | paste -sd' ')
+  printf '%s\n' "$base${2:+ $1=$2}" > "$KCMD"
+}
+rebuild() {   # rebuild the images (and re-sign them, if Secure Boot keys exist)
+  [ -n "${HARDEN_NO_REBUILD:-}" ] && return 0        # the installer builds the images once, after all modules
+  mkinitcpio -P >/dev/null || die "mkinitcpio failed: check the boot images before rebooting"
+  if command -v sbctl >/dev/null && { [ -d /var/lib/sbctl/keys ] || [ -d /usr/share/secureboot/keys ]; }; then
+    sbctl sign-all >/dev/null 2>&1 || true
+  fi
+}
+
+firewall() {
+  case "${1:-on}" in
+    on)
+      need ufw
+      if ((chroot_)); then      # ufw's own commands need the running kernel: write its settings instead
+        sed -i 's/^DEFAULT_INPUT_POLICY=.*/DEFAULT_INPUT_POLICY="DROP"/; s/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
+        sed -i 's/^ENABLED=.*/ENABLED=yes/' /etc/ufw/ufw.conf
+      else
+        ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null; ufw --force enable >/dev/null
+      fi
+      enable ufw; say "firewall on: incoming denied" ;;
+    off) ((chroot_)) || ufw --force disable >/dev/null; systemctl disable ufw >/dev/null 2>&1; say "firewall off" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+sysctl_m() {
+  case "${1:-on}" in
+    on)
+      cat > "$SYSCTL" <<'C'
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.yama.ptrace_scope=1
+kernel.kexec_load_disabled=1
+kernel.sysrq=0
+kernel.perf_event_paranoid=3
+kernel.unprivileged_bpf_disabled=1
+net.core.bpf_jit_harden=2
+vm.unprivileged_userfaultfd=0
+dev.tty.ldisc_autoload=0
+fs.protected_symlinks=1
+fs.protected_hardlinks=1
+fs.protected_fifos=2
+fs.protected_regular=2
+fs.suid_dumpable=0
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_rfc1337=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=0
+C
+      ((chroot_)) || sysctl -q --system >/dev/null 2>&1 || true
+      say "sysctl hardening on" ;;
+    off) rm -f "$SYSCTL"; say "sysctl file removed: the old values return at the next boot" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+usb() {
+  case "${1:-on}" in
+    on)
+      need usbguard
+      local rules=/etc/usbguard/rules.conf
+      if ((chroot_)); then
+        # the devices that matter are the ones plugged in at the first boot (not the install stick): generate
+        # the allow-list then, once, and only then start enforcing. Never on empty rules (the keyboard).
+        cat > /etc/systemd/system/harden-usbguard-init.service <<'U'
+[Unit]
+Description=USBGuard: allow the USB devices present at the first boot
+ConditionFileNotEmpty=!/etc/usbguard/rules.conf
+Before=usbguard.service
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'usbguard generate-policy > /etc/usbguard/rules.conf.new && [ -s /etc/usbguard/rules.conf.new ] && install -m600 /etc/usbguard/rules.conf.new /etc/usbguard/rules.conf; rm -f /etc/usbguard/rules.conf.new'
+[Install]
+WantedBy=multi-user.target
+U
+        systemctl enable harden-usbguard-init.service usbguard.service >/dev/null 2>&1
+        say "usbguard: the devices present at the first boot are allowed, new ones blocked"
+        return
+      fi
+      if [ ! -s "$rules" ]; then
+        usbguard generate-policy > "$rules.new" || die "could not read the USB devices"
+        [ -s "$rules.new" ] || { rm -f "$rules.new"; die "no USB devices seen, leaving USBGuard off"; }
+        install -m600 "$rules.new" "$rules"; rm -f "$rules.new"
+      fi
+      enable usbguard || die "usbguard did not start"
+      say "usbguard on: $(wc -l < "$rules") devices allowed, new ones blocked" ;;
+    off) systemctl disable --now usbguard harden-usbguard-init >/dev/null 2>&1; say "usbguard off" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+dns_guard_rules() {   # plain DNS (53, 853 DoT) only into VPN tunnels (WireGuard wg*: PIA, Mullvad, IVPN; OpenVPN tun*); the DoH proxy itself talks HTTPS on 443
+  cat <<'N'
+table inet harden_dns_guard {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    oifname "lo" accept
+    oifname "wg*" accept
+    oifname "tun*" accept
+    meta l4proto { tcp, udp } th dport { 53, 853 } drop
+  }
+}
+N
+}
+dns() {
+  case "${1:-on}" in
+    on)
+      need dnscrypt-proxy nftables
+      install -d /etc/dnscrypt-proxy /etc/systemd/resolved.conf.d /etc/systemd/system/dnscrypt-proxy.service.d
+      cat > "$DOH_CONF" <<C
+listen_addresses = ['$DOH_ADDR']
+server_names = ['quad9']
+doh_servers = true
+dnscrypt_servers = false
+require_dnssec = true
+require_nolog = true
+ignore_system_dns = true
+bootstrap_resolvers = ['9.9.9.9:53']
+netprobe_timeout = 0
+cache = true
+
+[static.'quad9']
+stamp = '$STAMP'
+C
+      /usr/bin/dnscrypt-proxy -config "$DOH_CONF" -check >/dev/null 2>&1 || die "dnscrypt-proxy rejects the config; nothing switched"
+      printf '[Unit]\nRequires=\nAfter=network.target\n[Service]\nExecStart=\nExecStart=/usr/bin/dnscrypt-proxy --config %s\n' "$DOH_CONF" \
+        > /etc/systemd/system/dnscrypt-proxy.service.d/harden.conf
+      printf '[Resolve]\nDNS=%s\nDomains=~.\nDNSOverTLS=no\nFallbackDNS=\n' "$DOH_ADDR" > "$RESOLVED"
+      install -d "$LIB"; dns_guard_rules > "$LIB/dns-guard.nft"
+      cat > "/etc/systemd/system/$GUARD" <<U
+[Unit]
+Description=Block plain DNS outside VPN tunnels (DNS over HTTPS is in use)
+After=network-pre.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f $LIB/dns-guard.nft
+ExecStop=/usr/bin/nft delete table inet harden_dns_guard
+[Install]
+WantedBy=multi-user.target
+U
+      # resolved answers the system (NetworkManager hands it the network's DNS, which resolved then ignores
+      # for the ~. route above)
+      if ((chroot_)); then ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf.harden   # see the installer
+      else ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf; fi
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      enable systemd-resolved dnscrypt-proxy "$GUARD"
+      ((chroot_)) || systemctl restart systemd-resolved
+      say "DNS over HTTPS (Quad9) on; plain DNS blocked outside VPN tunnels. Sign-in pages: harden dns portal" ;;
+    off)
+      rm -f "$RESOLVED"; systemctl disable --now "$GUARD" dnscrypt-proxy >/dev/null 2>&1
+      ((chroot_)) || systemctl restart systemd-resolved; say "DNS over HTTPS off: the network's DNS again" ;;
+    portal)
+      local m=${2:-5}; [[ $m =~ ^[0-9]+$ ]] || die "minutes, please"
+      systemctl stop "$GUARD"; rm -f "$RESOLVED"; systemctl restart systemd-resolved
+      systemd-run --quiet --collect --on-active="${m}m" --unit=harden-dns-portal-end \
+        /bin/sh -c "\"$(realpath "$0")\" dns on" >/dev/null 2>&1
+      say "plain DNS allowed for $m minutes (sign in now); DoH comes back by itself" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+apparmor() {
+  case "${1:-on}" in
+    on)  need apparmor; enable apparmor; kparam lsm "$LSM"; rebuild; say "AppArmor from the next boot (packaged profiles)" ;;
+    off) systemctl disable apparmor >/dev/null 2>&1; kparam lsm; rebuild; say "AppArmor off from the next boot" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+lockdown() {
+  case "${1:-on}" in
+    on)  kparam lockdown integrity; rebuild; say "lockdown=integrity from the next boot" ;;
+    off) kparam lockdown; rebuild; say "lockdown off from the next boot" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+keep() {
+  local hooks=/etc/pacman.d/hooks w kern
+  kern=$(pacman -Qq linux-hardened 2>/dev/null || pacman -Qq linux 2>/dev/null || echo linux-hardened)
+  case "${1:-on}" in
+    on)
+      install -d "$hooks" "$LIB"
+      cat > "$LIB/uki-keep" <<'K'
+#!/bin/sh
+# uki-keep pre|post KERNEL: keep the last 2 UKIs (and their modules) of KERNEL as boot entries in case an update
+# breaks. A kept image is a plain copy, so it stays signed.
+set -u
+K=${2:-linux-hardened}; L=/boot/EFI/Linux; MODS=/usr/lib/modules; KEEP=/usr/lib/modules-keep; N=2
+cur() { for d in "$MODS"/*/; do [ "$(cat "$d/pkgbase" 2>/dev/null)" = "$K" ] && [ -f "$d/vmlinuz" ] && basename "$d"; done | sort -V | tail -1; }
+case "${1:-}" in
+  pre)
+    v=$(cur); [ -n "$v" ] && [ -f "$L/arch-$K.efi" ] || exit 0
+    [ -f "$L/arch-$K-$v.efi" ] || cp "$L/arch-$K.efi" "$L/arch-$K-$v.efi"
+    mkdir -p "$KEEP"; [ -d "$KEEP/$v" ] || cp -a "$MODS/$v" "$KEEP/$v" ;;
+  post)
+    v=$(cur); [ -n "$v" ] && { rm -f "$L/arch-$K-$v.efi"; rm -rf "${KEEP:?}/$v"; }
+    kept=$(ls "$L"/arch-"$K"-[0-9]*.efi 2>/dev/null | sed "s|.*/arch-$K-||; s|\.efi\$||" | sort -V)
+    for k in $(printf '%s\n' "$kept" | grep . | head -n -"$N"); do
+      rm -f "$L/arch-$K-$k.efi"; rm -rf "${KEEP:?}/$k"
+      [ -d "$MODS/$k" ] && [ ! -e "$MODS/$k/pkgbase" ] && rm -rf "${MODS:?}/$k"
+    done
+    for k in $(printf '%s\n' "$kept" | grep . | tail -n "$N"); do
+      [ -d "$KEEP/$k" ] && [ ! -d "$MODS/$k" ] && cp -al "$KEEP/$k" "$MODS/$k" && rm -f "$MODS/$k/vmlinuz" "$MODS/$k/pkgbase"
+    done
+    for d in "$KEEP"/*/; do [ -d "$d" ] || continue; k=$(basename "$d"); [ -f "$L/arch-$K-$k.efi" ] || rm -rf "$d"; done ;;
+esac
+exit 0
+K
+      chmod 755 "$LIB/uki-keep"
+      for w in pre post; do
+        cat > "$hooks/95-harden-uki-keep-$w.hook" <<H
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = $kern
+
+[Action]
+Description = $([ $w = pre ] && echo "Keeping the current kernel image as a boot entry" || echo "Keeping the last 2 kernel images")
+When = $([ $w = pre ] && echo PreTransaction || echo PostTransaction)
+Exec = $LIB/uki-keep $w $kern
+H
+      done
+      say "keep on: each $kern update keeps the previous image (last 2) in the boot menu" ;;
+    off) rm -f "$hooks"/95-harden-uki-keep-{pre,post}.hook; say "keep off" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+secureboot() {
+  [ -d /sys/firmware/efi ] || die "this machine doesn't boot with UEFI"
+  need sbctl
+  case "${1:-check}" in
+    check)
+      printf 'SecureBoot=%s SetupMode=%s\n' "$(efivar SecureBoot)" "$(efivar SetupMode)"
+      sbctl status; sbctl verify 2>&1 | grep -v 'vmlinuz-' ;;
+    sign|on)
+      sbctl status 2>/dev/null | grep -q 'Installed:.*✓' || sbctl create-keys >/dev/null || die "could not create keys"
+      # systemd-boot: bootctl installs the .signed copy, and sbctl keeps it signed across updates
+      local sd=/usr/lib/systemd/boot/efi/systemd-bootx64.efi f
+      [ -f "$sd" ] && sbctl sign -s -o "$sd.signed" "$sd" >/dev/null
+      for f in /boot/EFI/Linux/*.efi /boot/EFI/systemd/systemd-bootx64.efi /boot/EFI/BOOT/BOOTX64.EFI; do
+        [ -f "$f" ] && sbctl sign -s "$f" >/dev/null
+      done
+      # a bare kernel would take any initramfs: those stay unsigned on purpose
+      say "signed (sbctl re-signs after updates): $(sbctl list-files 2>/dev/null | grep -c '^/') files" ;;
+    enroll)
+      [ "$(efivar SetupMode)" = 1 ] || die "the firmware isn't in setup mode: clear its Secure Boot keys in the firmware settings first"
+      local ms=(); [ "${2:-}" = --microsoft ] && ms=(--microsoft)
+      sbctl enroll-keys "${ms[@]}" || die "enroll failed"
+      say "enrolled. Reboot, check 'harden secureboot check', then turn Secure Boot on in the firmware" ;;
+    off) say "turn Secure Boot off in the firmware settings; the keys stay in /var/lib/sbctl" ;;
+    *) die "$USAGE" ;;
+  esac
+}
+
+status() {
+  row() { printf '  %-11s %s\n' "$1" "$2"; }
+  row firewall "$(active ufw && echo on || echo off)"
+  row sysctl "$([ -f "$SYSCTL" ] && echo on || echo off)"
+  row usb "$(active usbguard && echo on || echo off)"
+  row dns "$(active "$GUARD" && echo "DoH on" || echo off)"
+  row apparmor "$(grep -qw apparmor /sys/kernel/security/lsm 2>/dev/null && echo on || echo off)"
+  row lockdown "$(grep -o '\[[a-z]*\]' /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]' || echo ?)"
+  row keep "$(ls /etc/pacman.d/hooks/95-harden-uki-keep-pre.hook >/dev/null 2>&1 && echo on || echo off)"
+  row secureboot "$([ "$(efivar SecureBoot)" = 1 ] && echo on || echo off)"
+}
+
+mod() {  # mod NAME [args]
+  local m=$1; shift
+  case $m in
+    firewall) firewall "$@" ;; sysctl) sysctl_m "$@" ;; usb) usb "$@" ;; dns) dns "$@" ;;
+    apparmor) apparmor "$@" ;; lockdown) lockdown "$@" ;; keep) keep "$@" ;; secureboot) secureboot "$@" ;;
+    *) die "unknown module: $m"$'\n'"$USAGE" ;;
+  esac
+}
+
+case "${1:-status}" in
+  status) status ;;
+  apply) shift; [ $# -gt 0 ] || die "$USAGE"; for m in "$@"; do (mod "$m" on) || exit 1; done ;;
+  -h|--help|help) echo "$USAGE" ;;
+  *) mod "$@" ;;
+esac

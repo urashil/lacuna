@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Anonium
+GenericName=Web Browser (Tor, disguised)
+Comment=Chromium in a sandbox through its own Tor, made to look like Chrome on Windows; throwaway profile
+Exec=/usr/local/bin/anonium %U
+Icon=chromium
+Categories=Network;WebBrowser;
+Terminal=false

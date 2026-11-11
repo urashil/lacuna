@@ -1,0 +1,6 @@
+# build output and everything secret or personal lives outside the repo (../work: keys, personal/, ISOs)
+/work/
+.env
+*.key
+*.pem
+__pycache__/

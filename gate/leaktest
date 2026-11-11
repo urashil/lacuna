@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# leaktest [--inject]: check, from this machine, that nothing leaves except the way the network mode says
+# (milestone 4's acceptance test). Root (run through Lacuna Settings, or sudo). Exit 0 = every check passed.
+#   --inject   negative control: open a deliberate hole (the live user may go out directly), run the checks, which
+#              must now FAIL, then close it again. A harness that can't see an injected leak proves nothing.
+set -u
+MODE=$(cat /run/lacuna-gate-mode 2>/dev/null || echo greeter)
+U=amnesia
+pass=0 fail=0
+ok()  { printf '  ok    %s\n' "$*"; pass=$((pass + 1)); }
+bad() { printf '  LEAK  %s\n' "$*"; fail=$((fail + 1)); }
+as() {   # run as that user, without opening a login session (setpriv, not runuser)
+    local who=$1; shift
+    if [ "$who" = root ]; then timeout 25 "$@"
+    else timeout 25 setpriv --reuid="$(id -u "$who")" --regid="$(id -g "$who")" --init-groups env HOME=/tmp "$@"; fi
+}
+vpn=""; case $MODE in pia|mullvad|ivpn) vpn=$MODE ;; tor+*) vpn=${MODE#tor+} ;; esac
+
+inject() {
+    nft insert rule inet lacuna output meta skuid "$U" accept
+    nft insert rule inet lacuna nat_output meta skuid "$U" accept
+}
+uninject() {
+    local h
+    for c in output nat_output; do
+        for h in $(nft -a list chain inet lacuna $c | awk '/skuid "?'"$U"'"? accept/ {print $NF}'); do
+            nft delete rule inet lacuna $c handle "$h"
+        done
+    done
+}
+
+checks() {
+    echo "mode: $MODE"
+    # 1. what the outside sees from a normal TCP connection, as the user and as root
+    local who j
+    for who in "$U" root; do
+        j=$(as "$who" curl -s --max-time 20 https://check.torproject.org/api/ip 2>/dev/null)
+        case $MODE in
+            tor-socks)                     # the opsec session: no redirect, so a plain connection must not get out
+                [ -z "$j" ] && ok "$who: no plain TCP out (only Tor's SOCKS ports)" || bad "$who: plain TCP got out: $j" ;;
+            tor|tor+*)
+                if [ -z "$j" ]; then ok "$who: TCP out: no answer (Tor not ready?), nothing direct"
+                elif printf '%s' "$j" | grep -q '"IsTor":true'; then ok "$who: TCP goes through Tor"
+                else bad "$who: TCP reached the internet NOT through Tor: $j"; fi ;;
+            offline|greeter)
+                [ -z "$j" ] && ok "$who: no TCP out at all" || bad "$who: TCP out in $MODE mode: $j" ;;
+            pia|mullvad|ivpn)
+                if [ -z "$j" ]; then ok "$who: TCP out: no answer (VPN down?), nothing direct"
+                else
+                    dev=$(ip route get 1.1.1.1 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2)
+                    case $dev in wg*|tun*) ok "$who: TCP goes through the $vpn tunnel ($dev)" ;;
+                                 *) bad "$who: TCP out, but the route is via $dev, not a VPN tunnel" ;; esac
+                fi ;;
+        esac
+    done
+    # 2. IPv6: off everywhere
+    as "$U" curl -6 -s --max-time 8 -o /dev/null https://ipv6.google.com 2>/dev/null &&
+        bad "$U: IPv6 got out" || ok "$U: no IPv6"
+    # 3. ICMP (ping): never allowed outside a VPN tunnel
+    if [ -z "$vpn" ] || [[ $MODE == tor+* ]]; then
+        as "$U" ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && bad "$U: ping got an answer" || ok "$U: no ICMP"
+    fi
+    # 4. UDP that isn't DNS (NTP here): dropped in the Tor modes (Tor carries TCP only)
+    if [[ $MODE == tor || $MODE == tor-socks || $MODE == tor+* || $MODE == offline ]]; then
+        if as "$U" python3 -I -c 'import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(4)
+s.sendto(b"\x1b"+47*b"\0",("162.159.200.1",123))
+try: s.recv(64); sys.exit(0)
+except OSError: sys.exit(1)' 2>/dev/null; then bad "$U: UDP (NTP) got an answer"; else ok "$U: no UDP besides DNS"; fi
+    fi
+    # 5. DNS: answered (through Tor's DNS port in the Tor modes), never by the network's own resolver
+    if [[ $MODE == tor || $MODE == tor+* ]]; then
+        if as "$U" python3 -I -c 'import socket,struct,sys
+q=struct.pack(">HHHHHH",0x4c41,0x0100,1,0,0,0)+b"\x07example\x03com\x00"+struct.pack(">HH",1,1)
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(8)
+s.sendto(q,("8.8.8.8",53)); r=s.recv(512); sys.exit(0 if r[:2]==q[:2] else 1)' 2>/dev/null; then
+            ok "$U: DNS to 8.8.8.8 is answered (redirected into Tor)"
+        else ok "$U: DNS to 8.8.8.8 got no answer (Tor not ready?), nothing direct"; fi
+    fi
+    # 5b. the opsec session: an app's own SOCKS port does reach Tor
+    if [[ $MODE == tor-socks ]]; then
+        j=$(as "$U" curl -s --max-time 25 --socks5-hostname 127.0.0.1:9160 https://check.torproject.org/api/ip 2>/dev/null)
+        printf '%s' "$j" | grep -q '"IsTor":true' && ok "$U: an app's SOCKS port (9160) goes through Tor" ||
+            ok "$U: app SOCKS port: no answer (Tor not ready?)"
+    fi
+    # 6. the Unsafe Browser's user: direct only when it was allowed
+    if id clearnet >/dev/null 2>&1; then
+        j=$(as clearnet curl -s --max-time 15 https://check.torproject.org/api/ip 2>/dev/null)
+        if [ -e /run/lacuna/unsafe ]; then ok "clearnet (Unsafe Browser) allowed: ${j:-no answer}"
+        elif [ -n "$j" ] && ! printf '%s' "$j" | grep -q '"IsTor":true' && [ -z "$vpn" ]; then
+            bad "clearnet got out directly although the Unsafe Browser is off: $j"
+        else ok "clearnet: no direct way out (Unsafe Browser off)"; fi
+    fi
+    echo "$pass passed, $fail leak(s)"
+}
+
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+case ${1:-} in
+    --inject)
+        echo "== negative control: a deliberate hole for $U (the checks must FAIL now)"
+        inject; trap uninject EXIT
+        checks
+        uninject; trap - EXIT
+        if [ "$fail" -gt 0 ]; then echo "== the harness saw the injected leak: good. The hole is closed again."; exit 0
+        else echo "== the harness did NOT see the injected leak: its checks are blind here. Hole closed."; exit 1; fi ;;
+    "") checks; [ "$fail" -eq 0 ] ;;
+    *) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

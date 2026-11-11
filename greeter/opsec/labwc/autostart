@@ -1,0 +1,6 @@
+# opsec session: the desktop and nothing else (no apps autostart)
+swaybg -i /usr/share/lacuna/greeter/wallpaper.png -m fill >/dev/null 2>&1 &
+waybar -c /usr/share/lacuna/opsec/waybar/config.jsonc -s /usr/share/lacuna/opsec/waybar/style.css >/dev/null 2>&1 &
+mako >/dev/null 2>&1 &
+# lock (with a password) or blank the screens after 5 min; the reaper counts either as away
+swayidle -w timeout 300 'lacuna-lock idle' resume 'lacuna-lock resume' before-sleep 'lacuna-lock idle' >/dev/null 2>&1 &

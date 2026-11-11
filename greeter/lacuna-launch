@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""lacuna-launch APP [URL]: ask greeterd to start tor-browser or unsafe-browser as its own user (see appbox)."""
+import json, os, socket, subprocess, sys
+
+app = sys.argv[1] if len(sys.argv) > 1 else ""
+url = next((a for a in sys.argv[2:] if a.startswith(("http://", "https://"))), "")
+names = {"tor-browser": "Tor Browser", "unsafe-browser": "Unsafe Browser"}
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(60)
+    s.connect("/run/greeterd/greeterd.sock")
+    s.sendall((json.dumps({"op": "launch", "app": app, "wayland": os.environ.get("WAYLAND_DISPLAY", ""),
+                           "url": url}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    r = json.loads(buf or b"{}")
+except (OSError, ValueError) as e:
+    r = {"ok": False, "error": f"greeterd: {e}"}
+if not r.get("ok"):
+    msg = r.get("error") or "could not start it"
+    print(f"lacuna-launch: {msg}", file=sys.stderr)
+    subprocess.run(["notify-send", "-a", "Lacuna", names.get(app, app) + " didn't start", msg])
+    sys.exit(1)

@@ -1,0 +1,7 @@
+* { font-family: "JetBrainsMono Nerd Font", monospace; font-size: 12px; min-height: 0; }
+window#waybar { background: rgba(17, 19, 24, 0.92); color: #e2e2e9; }
+#custom-apps, #clock, #custom-tor, #pulseaudio, #battery, #custom-lock, #custom-power { padding: 0 10px; }
+#custom-apps { color: #a6c8ff; }
+#taskbar button { padding: 0 6px; color: #c4c6d0; }
+#taskbar button.active { background: rgba(166, 200, 255, 0.18); color: #e2e2e9; }
+#custom-power { color: #ffb4ab; }

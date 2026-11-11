@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""vault: Lacuna's deniable persistence (PLAN section 5). Run as root.
+
+Layout of the boot stick (nothing points at the vault; everything after the ISO looks like random data):
+
+    [ ISO ][ random ......... 8 GiB ][ VeraCrypt volume, to 1 MiB before the end of the stick ][ random 1 MiB ]
+
+The VeraCrypt volume is an outer ("decoy") volume with a hidden volume at its end. All header data lives in its
+first and last 128 KiB; the rest is the random fill, so a stick with a vault looks like one without.
+
+    vault                       interactive menu (status, create, features, header backup)
+    vault status
+    vault create                make a new vault (erases the free space of the stick)
+    vault features [enable|disable NAME]
+    vault backup FILE | restore FILE      VeraCrypt: the 256 KiB of headers (a backup file shows that a vault exists)
+    vault unlock                passphrase on stdin -> JSON; used by greeterd, which also pads the timing
+    vault close
+    vault settings get | set    greeter settings inside the hidden volume (JSON on stdout / stdin)
+
+The typed passphrase is tried against the hidden volume and against the outer one at the same time:
+  - hidden opens: it holds the decoy passphrase, which opens the outer volume read-write, with the hidden range
+    mapped to an error target so the decoy can never overwrite the hidden volume;
+  - only the outer opens (the decoy passphrase, or a decoy-only vault): it is mounted read-write at ~/Persistent,
+    nothing else happens. Read-write on purpose: a decoy-only vault must work, and a decoy that opened read-only
+    would show that a hidden part is behind it. (Filling the decoy of a hidden vault up to the hidden part's
+    start can overwrite it: VeraCrypt's usual trade-off.)
+  - neither: "none", the same answer as a stick without a vault.
+"""
+import getpass, json, os, random, shutil, subprocess, sys, threading, time, zlib
+
+OFFSET = 8 << 30                    # the ISO must end before this; never changes between releases
+TAIL = 1 << 20                      # left alone at the end (tools that "repair" the ISO's GPT write there)
+ALIGN = 1 << 20
+HDR = 128 << 10                     # VeraCrypt: headers in the first and last 128 KiB
+MIN_REGION = 1 << 30
+RUN = "/run/lacuna"
+MNT = RUN + "/vault"                # the hidden volume (root only)
+STATE = RUN + "/vault.json"
+MOUNTS = RUN + "/vault-mounts"      # for wipe (busybox): mount points, unmount top to bottom
+DMS = RUN + "/vault-dm"             # for wipe: device-mapper names, remove top to bottom
+LOOPS = RUN + "/vault-loops"
+USER, UID, GID = "amnesia", 1000, 1000
+HOME = "/home/amnesia"
+DECOY_MNT = HOME + "/Persistent"
+PRIVATE = HOME + "/Private"
+SETTINGS = MNT + "/lacuna/settings.json"
+DECOY_PASS = MNT + "/lacuna/decoy"
+H, OR, O = "lacuna-v0", "lacuna-v1", "lacuna-v2"     # hidden, outer (raw), outer (protected)
+CRYPT = ["cryptsetup", "open", "--type", "tcrypt", "--veracrypt", "--hash", "sha512"]
+SFLC = "/usr/local/sbin/sflc"           # Shufflecake (milestone 9): the other backend
+SFLC_LOOPS = RUN + "/vault-sflc"        # loop devices Shufflecake has open (closed with `sflc close`)
+
+# persistent features: name -> (description, path, default on). Home paths are bind-mounted from the hidden volume.
+FEATURES = {
+    "wifi":        ("Wi-Fi networks and keys", "/etc/NetworkManager/system-connections", True),
+    "gnupg":       ("GnuPG keys", HOME + "/.gnupg", True),
+    "ssh":         ("SSH keys and config", HOME + "/.ssh", True),
+    "spotify":     ("Spotify login", HOME + "/.config/spotify", True),
+    "keepassxc":   ("KeePassXC settings (keep the database in ~/Private)", HOME + "/.config/keepassxc", True),
+    "thunderbird": ("Thunderbird profile", HOME + "/.thunderbird", False),
+    "electrum":    ("Electrum wallets", HOME + "/.electrum", False),
+    "librewolf":   ("LibreWolf profile", HOME + "/.librewolf", False),
+    "signal":      ("Signal", HOME + "/.config/Signal", False),
+    "element":     ("Element", HOME + "/.config/Element", False),
+    "bitwarden":   ("Bitwarden", HOME + "/.config/Bitwarden", False),
+    "simplex":     ("SimpleX Chat", HOME + "/.local/share/simplex", False),
+    "kiwix":       ("Kiwix offline library (ZIM files)", HOME + "/.local/share/kiwix-desktop", False),
+}
+
+
+class Fail(Exception):
+    pass
+
+
+def run(cmd, data=None, check=True, timeout=600):
+    r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout,
+                       text=not isinstance(data, bytes))
+    if check and r.returncode != 0:
+        err = r.stderr if isinstance(r.stderr, str) else r.stderr.decode(errors="replace")
+        raise Fail(f"{cmd[0]} failed: {err.strip().splitlines()[-1] if err.strip() else r.returncode}")
+    return r
+
+
+def cmdline():
+    return open("/proc/cmdline").read().split()
+
+
+# ---------------- where ----------------
+def boot_disk():
+    if "lacuna.stickless" in cmdline():
+        raise Fail("stickless mode: the stick isn't in use")
+    try:
+        name = open(RUN + "/boot-disk").read().strip()      # written by stickwatch at boot
+    except OSError:
+        name = ""
+    if not name:
+        args = dict(a.split("=", 1) for a in cmdline() if "=" in a)
+        dev = ""
+        for key, tag in (("archisosearchuuid", "UUID"), ("archisolabel", "LABEL")):
+            if not dev and args.get(key):
+                dev = run(["blkid", "-t", f"{tag}={args[key]}", "-o", "device"], check=False).stdout.split("\n")[0]
+        if not dev:
+            raise Fail("the boot stick wasn't found")
+        name = run(["lsblk", "-no", "PKNAME", dev], check=False).stdout.split("\n")[0].strip() or dev[5:]
+    if not os.path.exists(f"/sys/block/{name}"):
+        raise Fail("the boot stick is gone")
+    return f"/dev/{name}"
+
+
+def disk_size(disk):
+    return int(open(f"/sys/block/{os.path.basename(disk)}/size").read()) * 512
+
+
+def region(disk):
+    end = (disk_size(disk) - TAIL) // ALIGN * ALIGN
+    if end - OFFSET < MIN_REGION:
+        raise Fail(f"the stick is too small: it needs at least {(OFFSET + MIN_REGION + TAIL) >> 30} GiB "
+                   "(8 GiB for the system, the rest for the vault)")
+    return OFFSET, end - OFFSET
+
+
+def iso_end(disk):
+    """End of the ISO image: its ISO 9660 size or its last partition, whichever is further."""
+    end = 0
+    with open(disk, "rb") as f:
+        f.seek(32768)
+        pvd = f.read(2048)
+    if pvd[1:6] == b"CD001":
+        end = int.from_bytes(pvd[80:84], "little") * int.from_bytes(pvd[128:130], "little")
+    try:
+        t = json.loads(run(["sfdisk", "--json", disk], check=False).stdout)["partitiontable"]
+        ss = t.get("sectorsize", 512)
+        for p in t.get("partitions", []):
+            end = max(end, (p["start"] + p["size"]) * ss)
+    except (ValueError, KeyError):
+        pass
+    return end
+
+
+# ---------------- device plumbing ----------------
+def writable(disk):
+    """The internal-disk rule makes every non-USB disk read-only at boot, and the boot stick may be one (an SD card
+    reader, a virtual disk). The vault only ever uses the boot disk, so it may write there."""
+    run(["blockdev", "--setrw", disk], check=False)
+
+
+def loop(disk, off, size):
+    writable(disk)
+    return run(["losetup", "-f", "--show", "-o", str(off), "--sizelimit", str(size), disk]).stdout.strip()
+
+
+def try_open(dev, name, pw, hidden=False, readonly=False):
+    cmd = CRYPT + (["--tcrypt-hidden"] if hidden else []) + (["--readonly"] if readonly else []) + [dev, name]
+    return subprocess.run(cmd, input=pw.encode(), capture_output=True, timeout=300).returncode == 0
+
+
+def sflc_volumes():
+    try:
+        return [n for n in os.listdir("/dev/mapper") if n.startswith("sflc_")]
+    except OSError:
+        return []
+
+
+def sflc_open(dev, pw):
+    """Shufflecake: the password of volume M opens volumes 1..M. The new /dev/mapper names, lowest first ([]: none)."""
+    if not os.path.exists(SFLC):
+        return []
+    before = set(sflc_volumes())
+    r = subprocess.run([SFLC, "open", dev], input=(pw + "\n").encode(), capture_output=True, timeout=300)
+    new = sorted(set(sflc_volumes()) - before, key=lambda n: int(n.rsplit("_", 1)[1]))
+    if r.returncode == 0 and new:
+        write_lines(SFLC_LOOPS, read_lines(SFLC_LOOPS) + [dev])
+        return new
+    return []
+
+
+def dm_span(name):
+    """(offset, length) in sectors of a crypt mapping on its underlying device."""
+    f = run(["dmsetup", "table", name]).stdout.split()
+    return int(f[7]), int(f[1])          # start len crypt cipher key iv_offset dev offset
+
+
+def protect_outer():
+    """lacuna-v2 = the outer volume with the hidden volume's range turned into an error target."""
+    hoff, hlen = dm_span(H)
+    ooff, olen = dm_span(OR)
+    a = hoff - ooff
+    if a <= 0 or a + hlen > olen:
+        raise Fail("the hidden volume isn't inside the outer one")
+    t = f"0 {a} linear /dev/mapper/{OR} 0\n{a} {hlen} error\n"
+    if olen - a - hlen > 0:
+        t += f"{a + hlen} {olen - a - hlen} linear /dev/mapper/{OR} {a + hlen}\n"
+    run(["dmsetup", "create", O], data=t)
+    run(["udevadm", "settle"], check=False)
+
+
+def write_lines(path, lines):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(l + "\n" for l in lines))
+
+
+def read_lines(path):
+    try:
+        return [l for l in open(path).read().splitlines() if l]
+    except OSError:
+        return []
+
+
+def state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    fd = os.open(STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f)
+
+
+def add_mount(path):
+    write_lines(MOUNTS, [path] + [m for m in read_lines(MOUNTS) if m != path])
+
+
+def mkdir_user(path, mode=0o700):
+    """Create path (and missing parents under HOME) owned by the live user."""
+    parts, p = [], path
+    while not os.path.isdir(p):
+        parts.append(p); p = os.path.dirname(p)
+    for d in reversed(parts):
+        os.mkdir(d, mode if d == path else 0o755)
+        if d.startswith(HOME):
+            os.chown(d, UID, GID)
+
+
+def bind(src, dst):
+    run(["mount", "--bind", src, dst])
+    add_mount(dst)
+
+
+# ---------------- unlock / close ----------------
+def unlock(pw):
+    if state().get("kind"):
+        return {"result": "unlocked", "kind": state()["kind"]}
+    try:
+        disk = boot_disk()
+        off, size = region(disk)
+    except Fail:
+        return {"result": "none"}
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    # one loop device per attempt (cryptsetup wants its device to itself); all three run at once, so a wrong
+    # passphrase, the decoy one and either backend take about as long (greeterd pads the rest)
+    lh, lo, ls = loop(disk, off, size), loop(disk, off, size), loop(disk, off, size)
+    write_lines(LOOPS, [lh, lo, ls])
+    if len({lh, lo, ls}) < 3:
+        close()
+        return {"result": "none"}
+    res = {}
+    th = [threading.Thread(target=lambda: res.__setitem__("h", try_open(lh, H, pw, hidden=True))),
+          threading.Thread(target=lambda: res.__setitem__("o", try_open(lo, OR, pw))),
+          threading.Thread(target=lambda: res.__setitem__("s", sflc_open(ls, pw)))]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    try:
+        vols = res.get("s") or []
+        if vols:                                                 # Shufflecake: 2 volumes = hidden + decoy
+            for d in (H, OR):
+                run(["cryptsetup", "close", d], check=False)
+            if len(vols) >= 2:
+                os.makedirs(MNT, mode=0o700, exist_ok=True)
+                run(["mount", "-o", "nodev,nosuid,noatime", f"/dev/mapper/{vols[1]}", MNT])
+                add_mount(MNT)
+                save_state({"kind": "hidden", "backend": "shufflecake"})
+                # both are open, so Shufflecake allocates around the hidden one: the decoy can be written safely
+                try:
+                    mount_decoy(f"/dev/mapper/{vols[0]}", readonly=False)
+                except Fail as e:
+                    print(f"vault: decoy volume not mounted: {e}", file=sys.stderr)
+                apply_features()
+                return {"result": "unlocked", "kind": "hidden"}
+            mount_decoy(f"/dev/mapper/{vols[0]}", readonly=False)
+            save_state({"kind": "decoy", "backend": "shufflecake"})
+            return {"result": "unlocked", "kind": "decoy"}
+        if res.get("h"):
+            if res.get("o"):                                     # can't happen (create refuses equal passphrases)
+                run(["cryptsetup", "close", OR], check=False)
+            write_lines(DMS, [H])
+            os.makedirs(MNT, mode=0o700, exist_ok=True)
+            run(["mount", "-o", "nodev,nosuid,noatime", f"/dev/mapper/{H}", MNT])
+            add_mount(MNT)
+            save_state({"kind": "hidden", "backend": "veracrypt"})
+            try:
+                decoy = open(DECOY_PASS).read()
+                if try_open(lo, OR, decoy):
+                    protect_outer()
+                    write_lines(DMS, [O, OR, H])
+                    mount_decoy(f"/dev/mapper/{O}", readonly=False)
+            except (OSError, Fail) as e:
+                print(f"vault: decoy volume not opened: {e}", file=sys.stderr)
+            apply_features()
+            return {"result": "unlocked", "kind": "hidden"}
+        if res.get("o"):
+            write_lines(DMS, [OR])
+            mount_decoy(f"/dev/mapper/{OR}", readonly=False)
+            save_state({"kind": "decoy", "backend": "veracrypt"})
+            return {"result": "unlocked", "kind": "decoy"}
+    except Fail as e:
+        print(f"vault: {e}", file=sys.stderr)
+        close()
+        return {"result": "none"}
+    close()
+    return {"result": "none"}
+
+
+def mount_decoy(dev, readonly):
+    mkdir_user(DECOY_MNT)
+    opts = f"uid={UID},gid={GID},fmask=0077,dmask=0077,noatime,nodev,nosuid" + (",ro" if readonly else "")
+    run(["mount", "-t", "exfat", "-o", opts, dev, DECOY_MNT])
+    add_mount(DECOY_MNT)
+
+
+def close():
+    for m in read_lines(MOUNTS):
+        if run(["umount", m], check=False).returncode != 0:
+            run(["umount", "-l", m], check=False)
+    for l in read_lines(SFLC_LOOPS):
+        run([SFLC, "close", l], check=False)                    # writes out what's pending, removes its devices
+    for d in read_lines(DMS) or [O, OR, H]:
+        if os.path.exists(f"/dev/mapper/{d}"):
+            if run(["dmsetup", "remove", d], check=False).returncode != 0:
+                run(["dmsetup", "remove", "--force", d], check=False)    # error table: the key is gone either way
+    for l in read_lines(LOOPS):
+        run(["losetup", "-d", l], check=False)
+    for f in (MOUNTS, DMS, LOOPS, STATE, SFLC_LOOPS):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+
+
+# ---------------- features + settings (hidden volume only) ----------------
+def settings():
+    try:
+        return json.load(open(SETTINGS))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(s):
+    os.makedirs(os.path.dirname(SETTINGS), mode=0o700, exist_ok=True)
+    tmp = SETTINGS + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(s, f)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, SETTINGS)
+
+
+def enabled_features():
+    s = settings()
+    return s.get("features", [n for n, (_, _, on) in FEATURES.items() if on])
+
+
+def feature_src(name):
+    return f"{MNT}/features/{name}"
+
+
+def apply_feature(name):
+    _, dst, _ = FEATURES[name]
+    src = feature_src(name)
+    user = dst.startswith(HOME)
+    if not os.path.isdir(src):                     # first use: start from what the live system has now
+        os.makedirs(src, mode=0o700)
+        if os.path.isdir(dst):
+            run(["cp", "-a", dst + "/.", src])
+        if user:
+            os.chown(src, UID, GID)
+    if user:
+        mkdir_user(dst)
+    else:
+        os.makedirs(dst, exist_ok=True)
+    bind(src, dst)
+    if name == "wifi":
+        run(["nmcli", "connection", "reload"], check=False)
+
+
+def apply_features():
+    files = MNT + "/files"
+    if not os.path.isdir(files):
+        os.makedirs(files, mode=0o700); os.chown(files, UID, GID)
+    mkdir_user(PRIVATE)
+    bind(files, PRIVATE)
+    for n in enabled_features():
+        if n in FEATURES:
+            try:
+                apply_feature(n)
+            except (OSError, Fail) as e:
+                print(f"vault: feature {n}: {e}", file=sys.stderr)
+
+
+def need_hidden():
+    if state().get("kind") != "hidden":
+        raise Fail("the persistence isn't unlocked (type its passphrase in the greeter)")
+
+
+# ---------------- create ----------------
+def ask_pass(what):
+    while True:
+        a = getpass.getpass(f"{what} passphrase: ")
+        if len(a) < 8 or len(a) > 64 or not all(32 <= ord(c) < 127 for c in a):
+            print("  8 to 64 characters, plain ASCII (so it can be typed on any system and keyboard)."); continue
+        if getpass.getpass("  again: ") != a:
+            print("  they don't match."); continue
+        return a
+
+
+def looks_random(disk, start, end, samples=64):
+    rnd = random.SystemRandom()
+    with open(disk, "rb") as f:
+        for _ in range(samples):
+            f.seek(rnd.randrange(start, end - 65536) // 4096 * 4096)
+            b = f.read(65536)
+            if len(zlib.compress(b, 6)) < len(b) * 0.99:
+                return False
+    return True
+
+
+def fill(disk, start, end):
+    """Random data from start to end (bytes), with dd's progress line."""
+    writable(disk)
+    r = subprocess.run(["dd", "if=/dev/urandom", f"of={disk}", "bs=4M", f"seek={start}", f"count={end - start}",
+                        "oflag=seek_bytes", "iflag=count_bytes,fullblock", "conv=fsync", "status=progress"])
+    if r.returncode != 0:
+        raise Fail(f"writing random data to {disk} failed (see dd's message above); nothing else was changed")
+
+
+def veracrypt(args, pw, home):
+    env = {"PATH": "/usr/bin", "HOME": home, "LANG": "C.UTF-8"}   # its config/history go to a RAM dir that's thrown away
+    r = subprocess.run(["veracrypt", "--text", "--non-interactive", "--stdin", "--pim=0", "--keyfiles=",
+                        "--encryption=AES", "--hash=SHA-512", "--filesystem=none", "--quick",
+                        "--random-source=/dev/urandom"] + args, input=pw, text=True, capture_output=True, env=env)
+    if r.returncode != 0:
+        raise Fail("veracrypt: " + (r.stderr.strip() or r.stdout.strip()).splitlines()[-1])
+
+
+def create():
+    if os.geteuid() != 0:
+        raise Fail("run it as root: sudo vault create")
+    if state().get("kind"):
+        raise Fail("a persistence is open; reboot without unlocking it to create a new one")
+    disk = boot_disk()
+    off, size = region(disk)
+    writable(disk)
+    iend = iso_end(disk)
+    if iend > OFFSET:
+        raise Fail("this ISO is bigger than 8 GiB; the vault can't go after it")
+    gib = lambda b: f"{b / (1 << 30):.1f} GiB"
+    print(f"""
+Create persistence on {disk} ({gib(disk_size(disk))}): {gib(size)} for the vault.
+
+  1  Hidden + decoy (recommended):
+     - the DECOY passphrase is the one you can give up: it opens a plain folder, ~/Persistent;
+     - the HIDDEN passphrase is the one you type at every boot: it opens ~/Private, your saved settings
+       (Wi-Fi, PIA, admin password, ...), and the decoy folder, kept safe from overwriting the hidden part.
+  2  Decoy only: just the plain folder, ~/Persistent; no settings are kept. It opens exactly like the decoy
+     of a hidden vault, which is the point: because decoy-only vaults exist, a decoy alone doesn't suggest
+     a hidden part behind it.
+  There's no way to tell from the stick alone which kind it is, or that there's a vault at all.
+
+THIS ERASES EVERYTHING ON THE STICK AFTER THE SYSTEM, including any persistence made before.
+""")
+    kind = None
+    while kind is None:
+        kind = {"1": "hidden", "2": "decoy"}.get(input("Kind [1]: ").strip() or "1")
+    if input('Type "erase" to continue: ').strip() != "erase":
+        print("Nothing changed."); return
+    backend = None
+    have_sflc = os.path.exists(SFLC) and os.path.isdir("/sys/module/dm_sflc")
+    print("Backend:\n  1  VeraCrypt: opens on any system with VeraCrypt (recovery from Windows/macOS/Linux)")
+    if have_sflc:
+        print("  2  Shufflecake: also hides which parts of the stick changed between two copies of it (an attacker\n"
+              "     who images the stick more than once); Linux with Shufflecake only, newer software")
+    while backend is None:
+        a = input("Backend [1]: ").strip() or "1"
+        backend = {"1": "veracrypt", "2": "shufflecake" if have_sflc else None}.get(a)
+    hsize = None
+    if backend == "veracrypt" and kind == "hidden":   # Shufflecake allocates as it goes: no fixed split
+        max_h = size - (512 << 20)
+        default = (size * 3 // 4) >> 30
+        while True:
+            a = input(f"Size of the hidden part in GiB [{default}] (the decoy gets the rest): ").strip() or str(default)
+            try:
+                hsize = int(float(a) * (1 << 30)) // ALIGN * ALIGN
+            except ValueError:
+                continue
+            if 256 << 20 <= hsize <= max_h:
+                break
+            print(f"  between 0.25 and {max_h / (1 << 30):.1f}")
+    decoy = ask_pass("DECOY" if kind == "hidden" else "The")
+    hidden = None
+    while kind == "hidden":
+        hidden = ask_pass("HIDDEN")
+        if hidden != decoy:
+            break
+        print("  it must differ from the decoy passphrase.")
+
+    start = (iend + ALIGN - 1) // ALIGN * ALIGN
+    print("\nChecking whether the free space is already random (sticks written with `flash` are)...")
+    if looks_random(disk, start, off + size + TAIL):
+        print("  it is: only the headers need writing.")
+    else:
+        print(f"  it isn't: filling {gib(off + size + TAIL - start)} with random data. On a slow stick this takes a while.")
+        fill(disk, start, disk_size(disk))
+    try:
+        if backend == "veracrypt":
+            create_veracrypt(disk, off, size, hsize, decoy, hidden)
+        else:
+            create_shufflecake(disk, off, size, decoy, hidden)
+        run(["sync"])
+    finally:
+        close()
+        del decoy, hidden
+    print("\nDone. From the next boot, type the " + ("hidden " if kind == "hidden" else "") +
+          "passphrase in the greeter. This session goes on without it.")
+
+
+def populate_hidden(decoy=None):
+    """The hidden volume (mounted at MNT): settings, the decoy passphrase (VeraCrypt only: Shufflecake's hidden
+    password opens the decoy by itself), ~/Private, and what this session already has for the default features."""
+    os.makedirs(MNT + "/lacuna", mode=0o700)
+    if decoy is not None:
+        fd = os.open(DECOY_PASS, os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(decoy)
+    s = {"features": [n for n, (_, _, on) in FEATURES.items() if on]}
+    pw = shadow_hash()
+    if pw:
+        s["password_hash"] = pw
+    save_settings(s)
+    os.makedirs(MNT + "/files", mode=0o700); os.chown(MNT + "/files", UID, GID)
+    for n in s["features"]:                        # keep what this session already has (Wi-Fi joined, keys, ...)
+        _, dst, _ = FEATURES[n]
+        if os.path.isdir(dst):
+            os.makedirs(feature_src(n), mode=0o700)
+            run(["cp", "-a", dst + "/.", feature_src(n)])
+            if dst.startswith(HOME):
+                os.chown(feature_src(n), UID, GID)
+
+
+def create_veracrypt(disk, off, size, hsize, decoy, hidden):
+    mk = RUN + "/mk"
+    os.makedirs(mk, mode=0o700, exist_ok=True)
+    run(["mount", "-t", "tmpfs", "-o", f"size={size + (64 << 20)},mode=700", "lacuna-mk", mk])
+    try:
+        os.makedirs(mk + "/home", mode=0o700)
+        img = mk + "/v"
+        print("Writing the VeraCrypt headers...")
+        veracrypt(["--create", img, f"--size={size}", "--volume-type=normal"], decoy, mk + "/home")
+        if hidden is not None:
+            veracrypt(["--create", img, f"--size={hsize}", "--volume-type=hidden"], hidden, mk + "/home")
+        with open(img, "rb") as f:
+            head = f.read(HDR); f.seek(size - HDR); tail = f.read(HDR)
+    finally:
+        run(["umount", mk], check=False)
+    with open(disk, "r+b") as f:
+        f.seek(off); f.write(head)
+        f.seek(off + size - HDR); f.write(tail)
+        f.flush(); os.fsync(f.fileno())
+    del head, tail
+    print("Formatting...")
+    if hidden is None:                          # decoy only: one volume, a plain folder
+        lo = loop(disk, off, size)
+        write_lines(LOOPS, [lo])
+        if not try_open(lo, OR, decoy):
+            raise Fail("the new header doesn't open (nothing was saved)")
+        write_lines(DMS, [OR])
+        run(["mkfs.exfat", "-L", "Persistent", f"/dev/mapper/{OR}"])
+        return
+    lh, lo = loop(disk, off, size), loop(disk, off, size)
+    write_lines(LOOPS, [lh, lo])
+    if lh == lo:
+        raise Fail("losetup gave the same loop device twice")
+    if not try_open(lh, H, hidden, hidden=True) or not try_open(lo, OR, decoy):
+        raise Fail("the new headers don't open (nothing was saved)")
+    write_lines(DMS, [H])
+    protect_outer()
+    write_lines(DMS, [O, OR, H])
+    run(["mkfs.exfat", "-L", "Persistent", f"/dev/mapper/{O}"])
+    run(["mkfs.ext4", "-q", "-F", "-m", "0", "-E", "nodiscard", f"/dev/mapper/{H}"])
+    os.makedirs(MNT, mode=0o700, exist_ok=True)
+    run(["mount", f"/dev/mapper/{H}", MNT])
+    add_mount(MNT)
+    populate_hidden(decoy)
+
+
+def create_shufflecake(disk, off, size, decoy, hidden):
+    n = 1 if hidden is None else 2
+    print("Writing the Shufflecake headers" + (" (volume 1: decoy, volume 2: hidden)..." if n == 2 else "..."))
+    ls = loop(disk, off, size)
+    write_lines(LOOPS, [ls])
+    # the space is random already (checked or filled above): no second fill
+    r = subprocess.run([SFLC, f"--num-volumes={n}", "--skip-randfill", "init", ls],
+                       input=("".join(p + "\n" for p in (decoy, hidden) if p is not None)).encode(),
+                       capture_output=True, timeout=600)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).decode(errors="replace").strip().splitlines()
+        raise Fail("sflc init: " + (msg[-1] if msg else "failed"))
+    vols = sflc_open(ls, hidden if n == 2 else decoy)
+    if len(vols) != n:
+        raise Fail("the new volumes don't open (nothing was saved)")
+    print("Formatting...")
+    run(["mkfs.exfat", "-L", "Persistent", f"/dev/mapper/{vols[0]}"])
+    if n == 1:
+        return
+    run(["mkfs.ext4", "-q", "-F", "-m", "0", "-E", "nodiscard", f"/dev/mapper/{vols[1]}"])
+    os.makedirs(MNT, mode=0o700, exist_ok=True)
+    run(["mount", f"/dev/mapper/{vols[1]}", MNT])
+    add_mount(MNT)
+    populate_hidden(None)
+
+
+def shadow_hash():
+    for line in open("/etc/shadow"):
+        name, pw = line.split(":", 2)[:2]
+        if name == USER and pw and not pw.startswith(("!", "*")):
+            return pw
+    return None
+
+
+# ---------------- small commands ----------------
+def status():
+    k, b = state().get("kind"), state().get("backend", "veracrypt")
+    print({"hidden": f"Persistence: open ({b}: ~/Private, settings, decoy at ~/Persistent)",
+           "decoy": f"Persistence: open ({b}: ~/Persistent; no saved settings)"}.get(k, "Persistence: not in use this session"))
+    if k == "hidden":
+        on = enabled_features()
+        for n, (desc, path, _) in FEATURES.items():
+            print(f"  [{'x' if n in on else ' '}] {n:<12} {desc}")
+
+
+def features(argv):
+    if not argv:
+        status(); return
+    need_hidden()
+    if argv == ["--json"]:
+        on = enabled_features()
+        print(json.dumps([{"name": n, "description": d, "on": n in on} for n, (d, _, _) in FEATURES.items()]))
+        return
+    if len(argv) != 2 or argv[0] not in ("enable", "disable") or argv[1] not in FEATURES:
+        raise Fail("usage: vault features [enable|disable NAME]   (names: " + ", ".join(FEATURES) + ")")
+    s = settings()
+    on = enabled_features()
+    name = argv[1]
+    if argv[0] == "enable" and name not in on:
+        apply_feature(name)
+        on.append(name)
+    elif argv[0] == "disable" and name in on:
+        dst = FEATURES[name][1]
+        run(["umount", dst], check=False)
+        write_lines(MOUNTS, [m for m in read_lines(MOUNTS) if m != dst])
+        on.remove(name)
+        print(f"{name}: no longer kept; what was saved stays in the vault until it is enabled again")
+    s["features"] = on
+    save_settings(s)
+    if sys.stdout.isatty():
+        status()
+
+
+def headers(op, path):
+    if os.geteuid() != 0:
+        raise Fail("run it as root")
+    if state().get("backend") == "shufflecake":
+        raise Fail("header backups are for VeraCrypt; Shufflecake keeps its headers spread over the volume")
+    disk = boot_disk()
+    off, size = region(disk)
+    if op == "backup":
+        with open(disk, "rb") as f:
+            f.seek(off); a = f.read(HDR); f.seek(off + size - HDR); b = f.read(HDR)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(a + b)
+        print(f"Wrote {path}. Keep it somewhere safe: anyone who has it can tell a vault exists.")
+    else:
+        data = open(path, "rb").read()
+        if len(data) != 2 * HDR:
+            raise Fail("that isn't a vault header backup")
+        if input('Type "restore" to overwrite the headers on the stick: ').strip() != "restore":
+            return
+        with open(disk, "r+b") as f:
+            f.seek(off); f.write(data[:HDR]); f.seek(off + size - HDR); f.write(data[HDR:])
+            f.flush(); os.fsync(f.fileno())
+        print("Restored.")
+
+
+def menu():
+    while True:
+        print()
+        status()
+        print("\n  1  create a new persistence\n  2  choose what is kept\n  3  back up the headers\n  q  quit")
+        c = input("> ").strip()
+        try:
+            if c == "1":
+                create()
+            elif c == "2":
+                need_hidden()
+                n = input("feature name to switch on/off: ").strip()
+                features(["disable" if n in enabled_features() else "enable", n])
+            elif c == "3":
+                headers("backup", input("file to write: ").strip())
+            elif c in ("q", ""):
+                return
+        except Fail as e:
+            print(f"vault: {e}")
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        print("vault: needs root (sudo vault ...; set an admin password in the greeter first)", file=sys.stderr)
+        return 1
+    os.umask(0o077)
+    cmd = argv[0] if argv else ""
+    try:
+        if cmd == "":
+            menu()
+        elif cmd == "status":
+            status()
+        elif cmd == "create":
+            create()
+        elif cmd == "features":
+            features(argv[1:])
+        elif cmd in ("backup", "restore") and len(argv) == 2:
+            headers(cmd, argv[1])
+        elif cmd == "unlock":
+            print(json.dumps(unlock(sys.stdin.read())))
+        elif cmd == "close":
+            close()
+        elif cmd == "settings" and argv[1:] == ["get"]:
+            need_hidden(); print(json.dumps(settings()))
+        elif cmd == "settings" and argv[1:] == ["set"]:
+            need_hidden()
+            s = settings(); s.update(json.loads(sys.stdin.read())); save_settings(s)
+        else:
+            print(__doc__, file=sys.stderr); return 2
+    except Fail as e:
+        print(f"vault: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nvault: stopped", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

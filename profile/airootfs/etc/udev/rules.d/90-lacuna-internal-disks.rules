@@ -1,0 +1,14 @@
+# Internal disks (not removable, not on USB): read-only and hidden from udisks/file managers, so the live system
+# can't change them by accident or on purpose. The installer is the only thing that turns this off (blockdev --setrw).
+SUBSYSTEM!="block", GOTO="lacuna_end"
+# the installer (only after you typed the disk name) needs the new partitions writable
+TEST=="/run/lacuna/installing", GOTO="lacuna_end"
+ACTION!="add|change", GOTO="lacuna_end"
+KERNEL=="loop*|ram*|zram*|sr*|dm-*|md*|nbd*", GOTO="lacuna_end"
+ENV{ID_BUS}=="usb", GOTO="lacuna_end"
+ENV{ID_PATH}=="*-usb-*", GOTO="lacuna_end"
+ENV{DEVTYPE}=="disk", ATTR{removable}=="0", ENV{LACUNA_INTERNAL}="1"
+ENV{DEVTYPE}=="partition", ATTRS{removable}=="0", ENV{LACUNA_INTERNAL}="1"
+ENV{LACUNA_INTERNAL}=="1", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0", ENV{SYSTEMD_READY}="0"
+ENV{LACUNA_INTERNAL}=="1", ACTION=="add", RUN+="/usr/bin/blockdev --setro $devnode"
+LABEL="lacuna_end"

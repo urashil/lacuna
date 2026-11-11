@@ -1,0 +1,8 @@
+# Lacuna: the greeter session (niri + the lacuna-greeter TUI) runs as the unprivileged `greeter` user; it hands
+# over to `amnesia`'s niri-session through greetd once greeterd allows it.
+[terminal]
+vt = 1
+
+[default_session]
+command = "/usr/local/lib/lacuna/greeter-session"
+user = "greeter"

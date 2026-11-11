@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# stickwatch: at boot, find the disk Lacuna booted from and arm `wipe` (PLAN sections 6 and 7). It fires when
+#   - the boot stick goes away (not in stickless mode, where removing it is the point), or
+#   - the reaper asks for it (/run/lacuna/reap: locked for 6 hours), in every mode.
+# The busybox, the wipe script and the watcher all live in /run (RAM), so they still work once the stick is gone.
+# Not a udev RUN rule: that runs inside udevd's cgroup, so when wipe killed everything (udevd included) systemd
+# cleaned up udevd's cgroup, wipe with it, and restarted the greeter. This service lives in its own slice instead.
+set -euo pipefail
+stickless=0
+grep -qw lacuna.stickless /proc/cmdline && stickless=1
+
+uuid=$(sed -n 's/.*archisosearchuuid=\([^ ]*\).*/\1/p' /proc/cmdline)
+label=$(sed -n 's/.*archisolabel=\([^ ]*\).*/\1/p' /proc/cmdline)
+dev=""
+[[ -n $uuid ]] && dev=$(blkid -t UUID="$uuid" -o device 2>/dev/null | head -1) || true
+[[ -z $dev && -n $label ]] && dev=$(blkid -t LABEL="$label" -o device 2>/dev/null | head -1) || true
+disk=""
+if [[ -n $dev ]]; then
+    disk=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1)
+    [[ -n $disk ]] || disk=${dev#/dev/}
+fi
+
+install -d -m 700 /run/lacuna
+install -m 755 /usr/bin/busybox /run/lacuna/busybox      # static: works with the stick gone
+install -m 755 /usr/local/lib/lacuna/wipe /run/lacuna/wipe
+# where vault looks for its region, and (stickless) what the greeter waits for to be pulled
+[[ -n $disk ]] && echo "$disk" > /run/lacuna/boot-disk
+# dmsetup and its libraries, so wipe can destroy the vault's keys (device-mapper tables) with the stick gone
+install -d -m 700 /run/lacuna/dm
+cp -L /usr/bin/dmsetup /run/lacuna/dm/
+ldd /usr/bin/dmsetup | grep -o '/[^ ]*' | while read -r lib; do cp -L "$lib" /run/lacuna/dm/; done
+cat > /run/lacuna/watch <<'WATCH'
+#!/run/lacuna/busybox sh
+# runs from RAM for the whole session; wipe takes over this very process when it fires.
+# $1: the boot disk to watch, or empty (stickless, or not found): then only the reaper's request counts.
+B=/run/lacuna/busybox
+while [ ! -e /run/lacuna/reap ]; do
+    [ -n "$1" ] && [ ! -e "/sys/block/$1" ] && break
+    $B usleep 200000
+done
+exec /run/lacuna/wipe
+WATCH
+chmod 755 /run/lacuna/watch
+watch=$disk
+if ((stickless)); then
+    watch=""
+    echo "stickwatch: stickless mode, removing the stick is expected (only the reaper can fire)"
+elif [[ -n $disk ]]; then
+    echo "stickwatch: armed for /dev/$disk"
+else
+    echo "stickwatch: boot device not found; stick removal is NOT armed (only the reaper can fire)" >&2
+fi
+exec /run/lacuna/watch "$watch"

@@ -1,0 +1,5 @@
+#!/bin/sh
+# last step of a normal shutdown: processes are gone and RAM filesystems unmounted (init_on_free zeroed their pages);
+# drop what is left in the page cache too.
+sync
+echo 3 > /proc/sys/vm/drop_caches

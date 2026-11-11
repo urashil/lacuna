@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!-- opsec session: labwc, floating windows. Super = the Windows key. -->
+<labwc_config>
+  <core>
+    <gap>6</gap>
+  </core>
+  <theme>
+    <cornerRadius>6</cornerRadius>
+    <font place="ActiveWindow"><name>JetBrainsMono Nerd Font</name><size>10</size></font>
+    <font place="InactiveWindow"><name>JetBrainsMono Nerd Font</name><size>10</size></font>
+    <font place="MenuItem"><name>JetBrainsMono Nerd Font</name><size>10</size></font>
+  </theme>
+  <placement><policy>center</policy></placement>
+  <keyboard>
+    <default />
+    <keybind key="W-Return"><action name="Execute" command="foot" /></keybind>
+    <keybind key="W-space"><action name="Execute" command="sh -c 'XDG_DATA_DIRS=$LACUNA_OPSEC_SHARE fuzzel'" /></keybind>
+    <keybind key="W-d"><action name="Execute" command="sh -c 'XDG_DATA_DIRS=$LACUNA_OPSEC_SHARE fuzzel'" /></keybind>
+    <keybind key="W-b"><action name="Execute" command="tor-browser" /></keybind>
+    <keybind key="W-e"><action name="Execute" command="thunar" /></keybind>
+    <keybind key="W-A-l"><action name="Execute" command="lacuna-lock" /></keybind>
+    <keybind key="W-q"><action name="Close" /></keybind>
+    <keybind key="A-F4"><action name="Close" /></keybind>
+    <keybind key="W-Up"><action name="ToggleMaximize" /></keybind>
+    <keybind key="W-Down"><action name="Iconify" /></keybind>
+    <keybind key="W-Left"><action name="SnapToEdge" direction="left" /></keybind>
+    <keybind key="W-Right"><action name="SnapToEdge" direction="right" /></keybind>
+    <keybind key="A-Tab"><action name="NextWindow" /></keybind>
+  </keyboard>
+  <windowRules>
+    <!-- Tor Browser floats at its own (letterboxed) size: never stretched to the screen -->
+    <windowRule identifier="Tor Browser" serverDecoration="yes" />
+  </windowRules>
+</labwc_config>

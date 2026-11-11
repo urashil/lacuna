@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# gate: Lacuna's network layer (PLAN section 4). After the greeter nothing leaves the machine except through Tor or
+# a VPN (PIA, Mullvad, IVPN); enforced by a default-drop nftables ruleset (the Tails approach; the plan's namespace version can replace the
+# inside later without changing this interface).
+#
+#   gate apply greeter     boot default: DHCP + NTP only (time sync before Tor), nothing from any user
+#   gate apply tor         only the tor user goes out; everyone else's TCP + DNS is redirected into Tor
+#   gate apply VPN         only through the VPN's tunnel (plus its daemon itself, to build it); VPN = pia|mullvad|ivpn
+#   gate apply tor+VPN     Tor, whose own traffic may only use that VPN's tunnel
+#   gate apply tor-socks   the opsec session (Tails' model): only the tor user goes out, nothing is redirected; apps
+#                          reach Tor only through its SOCKS ports (one port per app: separate circuits), and
+#                          anything else gets no network at all
+#   gate apply offline     nothing but loopback
+#   gate apply direct      no filtering (only with lacuna.direct on the kernel command line: development)
+#   gate status            JSON: mode, Tor bootstrap %, VPN state
+#   gate refresh           reload the current mode's rules only (after the Unsafe Browser was switched)
+#
+# Bridges: /run/lacuna/bridges (one bridge line per line, or "builtin:obfs4|snowflake|meek").
+# Restricted network: /run/lacuna/restricted exists -> Tor connects only over port 443: relays and built-in obfs4
+# bridges on 443 (meek is HTTPS anyway; Snowflake needs UDP and won't work there). PIA isn't affected.
+# VPN login: /run/lacuna/vpn-credentials (0600), consumed and deleted on use. PIA: username and password lines;
+# Mullvad and IVPN: the account number / ID on one line.
+set -euo pipefail
+RUN=/run/lacuna
+MODEFILE=/run/lacuna-gate-mode          # world-readable: the Tor Browser launcher looks at it
+PT=/opt/tor-browser/Browser/TorBrowser/Tor/PluggableTransports
+PTCONF=/usr/share/lacuna/tor/pt_config.json
+TORLOG=/var/log/tor/notices.log       # tor.service may only write /var/lib/tor and /var/log/tor
+VPNS="pia mullvad ivpn"
+CREDS=$RUN/vpn-credentials
+# per VPN: its daemon's unit (the firewall lets that cgroup out, to build the tunnel) and its tunnel interfaces
+vpn_unit() { case $1 in pia) echo piavpn.service ;; mullvad) echo mullvad-daemon.service ;; ivpn) echo ivpn-service.service ;; esac; }
+vpn_ifs()  { case $1 in pia) echo '{ "wgpia0", "tun0" }' ;; mullvad) echo '{ "wg0-mullvad", "tun0" }' ;; ivpn) echo '{ "wgivpn", "tun0" }' ;; esac; }
+vpn_name() { case $1 in pia) echo PIA ;; mullvad) echo Mullvad ;; ivpn) echo IVPN ;; esac; }
+
+die() { echo "gate: $*" >&2; exit 1; }
+mkdir -p -m 700 "$RUN"
+
+# ---------------- nftables ----------------
+ruleset() {   # $1 = mode
+    local out=() nat=()
+    # the Unsafe Browser (user clearnet, captive-portal sign-in): straight out, never into Tor, when allowed
+    if [[ -e $RUN/unsafe && $1 != offline && $1 != greeter && $1 != tor-socks ]]; then
+        out+=('meta skuid "clearnet" accept')
+        nat+=('meta skuid "clearnet" accept')            # first in the nat chain: never redirected into Tor
+    fi
+    case $1 in
+        greeter)
+            out+=('meta skuid "systemd-timesync" udp dport { 53, 123 } accept'
+                  'meta skuid "systemd-timesync" tcp dport 53 accept') ;;
+        tor-socks)
+            out+=('meta skuid "tor" accept') ;;
+        tor)
+            out+=('meta skuid "tor" accept')
+            nat+=('meta skuid != "tor" ip daddr != 127.0.0.0/8 meta l4proto tcp redirect to :9040'
+                  'meta skuid != "tor" udp dport 53 redirect to :5353') ;;
+        pia|mullvad|ivpn)
+            out+=("oifname $(vpn_ifs "$1") accept"
+                  "socket cgroupv2 level 2 \"system.slice/$(vpn_unit "$1")\" accept") ;;
+        tor+pia|tor+mullvad|tor+ivpn)
+            out+=("meta skuid \"tor\" oifname $(vpn_ifs "${1#tor+}") accept"
+                  "socket cgroupv2 level 2 \"system.slice/$(vpn_unit "${1#tor+}")\" accept")
+            nat+=('meta skuid != "tor" ip daddr != 127.0.0.0/8 meta l4proto tcp redirect to :9040'
+                  'meta skuid != "tor" udp dport 53 redirect to :5353') ;;
+        offline) ;;
+        direct)
+            out+=('accept') ;;
+    esac
+    cat <<EOF
+table inet lacuna
+delete table inet lacuna
+table inet lacuna {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        udp sport 67 udp dport 68 accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oif "lo" accept
+        # what nat_output redirected into Tor (TransPort/DNSPort) is addressed to loopback now, but this chain still
+        # sees the original route (oif = the network card): accept it by its new destination, which can't leave
+        ip daddr 127.0.0.0/8 accept
+        meta nfproto ipv6 drop
+        ct state established,related accept
+        udp sport 68 udp dport 67 accept
+$(for r in "${out[@]}"; do printf '        %s\n' "$r"; done)
+    }
+    chain nat_output {
+        type nat hook output priority dstnat; policy accept;
+$(for r in "${nat[@]}"; do printf '        %s\n' "$r"; done)
+    }
+}
+EOF
+}
+
+load() { ruleset "$1" | nft -f - || die "nftables refused the $1 ruleset"; }
+
+# ---------------- Tor ----------------
+APP_PORTS="9160-9179"   # tor-socks: one SocksPort per app (torapp); Tor never mixes streams from different ports
+
+write_torrc() {   # $1 = mode
+    local -a lines=() bridges=()
+    [[ -s $RUN/bridges ]] && mapfile -t bridges < "$RUN/bridges"
+    lines+=("User tor" "DataDirectory /var/lib/tor" "ClientOnly 1" "AvoidDiskWrites 1"
+            "Log notice file $TORLOG"
+            "SocksPort 127.0.0.1:9050 IsolateDestAddr IsolateDestPort"
+            "SocksPort 127.0.0.1:9150 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth"
+            "ClientUseIPv6 0")
+    if [[ ${1:-tor} == tor-socks ]]; then
+        local p
+        for p in $(seq ${APP_PORTS%-*} ${APP_PORTS#*-}); do lines+=("SocksPort 127.0.0.1:$p IsolateDestAddr"); done
+    else                                   # the transparent modes: TCP and DNS of everyone else get redirected here
+        lines+=("TransPort 127.0.0.1:9040 IsolateClientAddr IsolateDestAddr IsolateDestPort"
+                "DNSPort 127.0.0.1:5353" "AutomapHostsOnResolve 1" "VirtualAddrNetworkIPv4 10.192.0.0/10")
+    fi
+    local restricted=0
+    [[ -e $RUN/restricted ]] && restricted=1
+    if ((restricted)) && ! ((${#bridges[@]})); then
+        lines+=("ReachableAddresses accept *:443" "ReachableAddresses reject *:*")
+    fi
+    if ((${#bridges[@]})); then
+        lines+=("UseBridges 1"
+                "ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit,webtunnel exec $PT/lyrebird"
+                "ClientTransportPlugin snowflake exec $PT/lyrebird")
+        local b
+        for b in "${bridges[@]}"; do
+            case $b in
+                builtin:*)
+                    # restricted: only the built-in bridges whose address is on port 443 (meek's is a placeholder)
+                    python3 -I -c 'import json,sys
+for l in json.load(open(sys.argv[1]))["bridges"].get(sys.argv[2], []):
+    if sys.argv[3] == "0" or sys.argv[2] != "obfs4" or l.split()[1].endswith(":443"):
+        print("Bridge " + l)' "$PTCONF" "${b#builtin:}" "$restricted" ;;
+                *) printf 'Bridge %s\n' "${b#Bridge }" ;;
+            esac
+        done > "$RUN/bridge-lines"
+        mapfile -t -O "${#lines[@]}" lines < "$RUN/bridge-lines"
+        rm -f "$RUN/bridge-lines"
+    fi
+    printf '%s\n' "${lines[@]}" > /etc/tor/torrc
+    chmod 644 /etc/tor/torrc
+    install -d -o tor -g tor -m 750 /var/log/tor
+    : > "$TORLOG"; chown tor:tor "$TORLOG"; chmod 640 "$TORLOG"
+}
+
+start_tor() {   # $1 = mode
+    write_torrc "${1:-tor}"
+    tor -f /etc/tor/torrc --verify-config >/dev/null || die "tor rejected its configuration"
+    systemctl restart tor.service
+}
+
+# ---------------- VPNs ----------------
+oneline() { printf '%s' "$1" | tr '\n' ' ' | cut -c1-160; }
+
+vpn_state() {   # a short state word; never waits for a daemon that isn't running (their CLIs hang then)
+    systemctl -q is-active "$(vpn_unit "$1")" || return 0
+    case $1 in
+        pia)     timeout 3 piactl get connectionstate 2>/dev/null || true ;;
+        mullvad) timeout 3 mullvad status 2>/dev/null | head -1 | awk '{print $1}' || true ;;
+        ivpn)    timeout 3 ivpn status 2>/dev/null | awk -F: '/^VPN/ {gsub(/ /, "", $2); print $2; exit}' || true ;;
+    esac
+}
+vpn_connected() { [[ $(vpn_state "$1" | tr '[:upper:]' '[:lower:]') == connected ]]; }
+
+vpn_login() {   # $1 = vpn; credentials from $CREDS (deleted afterwards whatever happens)
+    local out ok=0 _
+    for _ in 1 2 3; do       # right after the network comes up the account check can take a few tries
+        case $1 in
+            pia)     timeout 10 piactl logout >/dev/null 2>&1 || true
+                     out=$(timeout 30 piactl login "$CREDS" 2>&1) && ok=1 ;;
+            mullvad) # the account number goes in through stdin, not argv
+                     timeout 10 mullvad account logout >/dev/null 2>&1 || true
+                     out=$(head -1 "$CREDS" | timeout 30 mullvad account login 2>&1) && ok=1 ;;
+            ivpn)    timeout 10 ivpn logout >/dev/null 2>&1 || true
+                     out=$(timeout 30 ivpn login "$(head -1 "$CREDS")" 2>&1) && ok=1 ;;   # only reads a TTY: argv
+        esac
+        ((ok)) && break
+        echo "gate: $1 login: $out" >&2       # the message only, never the credentials
+        sleep 3
+    done
+    rm -f "$CREDS"
+    ((ok)) || die "$(vpn_name "$1") login failed: $(oneline "$out")"
+}
+
+start_vpn() {   # $1 = vpn
+    local v=$1 unit _ out
+    unit=$(vpn_unit "$v")
+    systemctl start "$unit"
+    for _ in $(seq 30); do [[ -n $(vpn_state "$v") ]] && break; sleep 1; done
+    case $v in
+        pia)     piactl background enable >/dev/null 2>&1 || true ;;    # the daemon acts without its GUI
+        mullvad) mullvad auto-connect set off >/dev/null 2>&1 || true
+                 mullvad lockdown-mode set off >/dev/null 2>&1 || true ;;  # Lacuna's firewall does that job
+    esac
+    [[ -s $CREDS ]] && vpn_login "$v"
+    case $v in
+        pia)     piactl set region auto >/dev/null 2>&1 || true
+                 out=$(timeout 30 piactl connect 2>&1) || die "PIA did not connect: $(oneline "$out")" ;;
+        mullvad) out=$(timeout 60 mullvad connect --wait 2>&1) || die "Mullvad did not connect: $(oneline "$out")" ;;
+        ivpn)    out=$(timeout 60 ivpn connect -fastest 2>&1) || die "IVPN did not connect: $(oneline "$out")" ;;
+    esac
+}
+
+rice_provider() {   # the bar's VPN menu (vpnctl) follows ~/.config/rice/vpn.json: point it at the VPN in use
+    local f=/home/amnesia/.config/rice/vpn.json cur
+    id amnesia >/dev/null 2>&1 || return 0
+    install -d -o amnesia -g amnesia "$(dirname "$f")"
+    cur=$(cat "$f" 2>/dev/null); jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
+    # autoConnect off: the gate connects (and in the Tor modes no VPN daemon runs at all)
+    jq --arg p "$1" '.provider = $p | .autoConnect = false' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
+    chown amnesia:amnesia "$f"
+}
+
+stop_vpns() {   # every VPN except $1 (may be empty)
+    local v
+    for v in $VPNS; do
+        [[ $v == "${1:-}" ]] && continue
+        systemctl stop "$(vpn_unit "$v")" 2>/dev/null || true
+    done
+}
+
+# ---------------- modes ----------------
+apply() {
+    local mode=$1 vpn=""
+    case $mode in
+        greeter|tor|tor-socks|offline) ;;
+        pia|mullvad|ivpn) vpn=$mode ;;
+        tor+pia|tor+mullvad|tor+ivpn) vpn=${mode#tor+} ;;
+        direct) grep -qw lacuna.direct /proc/cmdline || die "direct mode needs lacuna.direct on the kernel command line" ;;
+        *) die "unknown mode: $mode" ;;
+    esac
+    # firewall first, so nothing slips out while services change
+    if [[ -n $vpn ]]; then
+        load offline                                  # closed while the VPN daemon (re)starts...
+        stop_vpns "$vpn"
+        systemctl start "$(vpn_unit "$vpn")"
+        load "$mode"                                  # ...its cgroup exists now, the rules can name it
+    else
+        load "$mode"
+    fi
+    [[ $mode == greeter ]] || systemctl stop systemd-timesyncd.service 2>/dev/null || true
+    [[ $mode == offline ]] && nmcli networking off >/dev/null 2>&1 || true
+    case $mode in
+        tor|tor-socks) stop_vpns; start_tor "$mode" ;;
+        pia|mullvad|ivpn) systemctl stop tor.service 2>/dev/null || true; start_vpn "$vpn"; rice_provider "$vpn" ;;
+        tor+*)   start_vpn "$vpn"; rice_provider "$vpn"
+                 for _ in $(seq 60); do vpn_connected "$vpn" && break; sleep 1; done; start_tor "$mode" ;;
+        offline) stop_vpns; systemctl stop tor.service 2>/dev/null || true ;;
+    esac
+    echo "$mode" > "$MODEFILE"; chmod 644 "$MODEFILE"
+}
+
+status() {
+    local mode tor_pct="" vpn="" vstate=""
+    mode=${1:-$(cat "$MODEFILE" 2>/dev/null || echo greeter)}   # greeterd passes the mode it is applying
+    local note=""
+    if [[ -r $TORLOG ]]; then
+        tor_pct=$(grep -o 'Bootstrapped [0-9]*%' "$TORLOG" | tail -1 | grep -o '[0-9]*' || true)
+        # the latest pluggable-transport message or warning, for "why is it stuck" (no addresses: cut at the colon)
+        note=$(grep -E 'Managed proxy|\[warn\]' "$TORLOG" | tail -1 | sed -E 's/^.*(Managed proxy "[^"]*\/|\[warn\] )//; s/"//g' |
+               cut -c1-120 || true)
+    fi
+    case $mode in pia|mullvad|ivpn) vpn=$mode ;; tor+*) vpn=${mode#tor+} ;; esac
+    [[ -n $vpn ]] && vstate=$(vpn_state "$vpn")
+    python3 -I -c 'import json,sys; print(json.dumps({"mode": sys.argv[1], "tor_bootstrap": int(sys.argv[2]) if sys.argv[2] else None,
+                    "vpn": sys.argv[3], "vpn_state": sys.argv[4], "tor_note": sys.argv[5], "restricted": sys.argv[6] == "1"}))' \
+        "$mode" "$tor_pct" "$vpn" "$vstate" "$note" "$([[ -e $RUN/restricted ]] && echo 1 || echo 0)"
+}
+
+case ${1:-} in
+    apply)  [[ -n ${2:-} ]] || die "usage: gate apply MODE"; apply "$2" ;;
+    status) status "${2:-}" ;;
+    refresh) load "$(cat "$MODEFILE" 2>/dev/null || echo greeter)" ;;   # rules only (the Unsafe Browser switch)
+    rules)  ruleset "${2:-greeter}" ;;               # print a ruleset without loading it (debugging)
+    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -1,0 +1,1157 @@
+#!/usr/bin/env python3
+"""installer: put an Arch system (optionally the rice) on this machine's disk (PLAN section 9). Run as root.
+
+  installer                    the TUI: every choice is a prompt, nothing is decided for you
+  installer --config FILE      replay a saved configuration (asks only for the passphrases and passwords)
+
+Every choice is kept in a JSON configuration, which can be saved (in the persistence, when it is unlocked:
+~/Private/lacuna-installer/) and loaded again for the next install. Passphrases and passwords are never saved.
+The installer is the only thing in Lacuna that writes to an internal disk, and only after you type its name.
+"""
+import getpass, json, os, re, shlex, shutil, subprocess, sys, threading, time
+
+VERSION = 1
+MNT = "/mnt/lacuna-install"
+GROUPS_FILE = "/usr/share/lacuna/installer/groups.json"
+SKEL = "/usr/share/lacuna/skel"
+REPO = "/opt/lacuna/repo"
+HARDEN = "/usr/local/bin/harden"
+LIVE_HOME = "/home/amnesia"
+HARDEN_MODULES = {
+    "firewall": ("Firewall (ufw): deny incoming", ["ufw"]),
+    "sysctl": ("Kernel and network hardening settings (sysctl)", []),
+    "usb": ("USBGuard: allow the devices present at the first boot, block new ones", ["usbguard"]),
+    "dns": ("DNS over HTTPS (Quad9); plain DNS blocked outside VPN tunnels", ["dnscrypt-proxy", "nftables"]),
+    "apparmor": ("AppArmor (packaged profiles)", ["apparmor"]),
+    "lockdown": ("Kernel lockdown (integrity)", []),
+    "keep": ("Keep the previous 2 kernel images as boot entries", []),
+}
+FS_PKG = {"xfs": "xfsprogs", "ext4": "e2fsprogs", "btrfs": "btrfs-progs"}
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- configuration
+def empty_config():
+    return {"version": VERSION,
+            "disk": {"device": None, "serial": None, "model": None, "size": None, "mode": None,
+                     "esp_size_mib": None, "esp": None, "root": None, "format_esp": None},
+            "luks": {"enabled": None, "cipher": None, "key_size": None, "pbkdf": None, "iter_time_ms": None,
+                     "tpm2": None, "tpm2_pcrs": None, "fido2": None},
+            "filesystem": None,
+            "swap": {"kind": None, "size_gib": None},
+            "boot": {"loader": None, "secureboot": None, "microsoft_keys": None, "enroll_now": None},
+            "login": None,
+            "packages": {"groups": [], "extra": []},
+            "system": {"hostname": None, "user": None, "shell": None, "timezone": None, "locale": None,
+                       "keymap": None},
+            "harden": [],
+            "dotfiles": None}
+
+
+def check_config(c):
+    """Every choice made, and each one sensible. Returns a list of problems (empty: ready)."""
+    p = []
+    d, l, s, b, sy = c["disk"], c["luks"], c["swap"], c["boot"], c["system"]
+    if not d.get("device"):
+        p.append("disk: no disk chosen")
+    if d.get("mode") not in ("guided", "manual"):
+        p.append("disk: choose guided or manual partitioning")
+    if d.get("mode") == "guided" and not (isinstance(d.get("esp_size_mib"), int) and 300 <= d["esp_size_mib"] <= 8192):
+        p.append("disk: EFI partition size between 300 and 8192 MiB")
+    if d.get("mode") == "manual" and not (d.get("esp") and d.get("root")):
+        p.append("disk: manual partitioning needs the EFI and the root partition")
+    if l.get("enabled") is None:
+        p.append("encryption: choose whether to encrypt")
+    if l.get("enabled"):
+        if not l.get("cipher") or not re.fullmatch(r"[a-z0-9-]+", l["cipher"]):
+            p.append("encryption: cipher")
+        if l.get("key_size") not in (256, 512):
+            p.append("encryption: key size 256 or 512")
+        if l.get("pbkdf") not in ("argon2id", "argon2i", "pbkdf2"):
+            p.append("encryption: key derivation argon2id, argon2i or pbkdf2")
+        if not (isinstance(l.get("iter_time_ms"), int) and 100 <= l["iter_time_ms"] <= 60000):
+            p.append("encryption: unlock time between 100 and 60000 ms")
+        if l.get("tpm2") and not re.fullmatch(r"[0-9]+(\+[0-9]+)*", str(l.get("tpm2_pcrs") or "")):
+            p.append("encryption: TPM2 PCRs like 7 or 0+7")
+    if c.get("filesystem") not in FS_PKG:
+        p.append("filesystem: xfs, ext4 or btrfs")
+    if s.get("kind") not in ("none", "zram", "swapfile"):
+        p.append("swap: none, zram or swapfile")
+    if s.get("kind") == "swapfile" and not (isinstance(s.get("size_gib"), int) and 1 <= s["size_gib"] <= 256):
+        p.append("swap: swapfile size 1-256 GiB")
+    if b.get("loader") not in ("systemd-boot", "none"):
+        p.append("boot: choose a boot loader (or none)")
+    if b.get("secureboot") is None:
+        p.append("boot: Secure Boot yes or no")
+    if b.get("secureboot") and b.get("loader") != "systemd-boot":
+        p.append("boot: Secure Boot here needs systemd-boot (signed UKIs)")
+    if c.get("login") not in ("greetd", "console"):
+        p.append("login: greetd (tuigreet) or the console")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", sy.get("hostname") or ""):
+        p.append("system: hostname (lowercase letters, digits, -)")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sy.get("user") or "") or sy.get("user") in ("root", "amnesia"):
+        p.append("system: user name (lowercase, not root)")
+    if sy.get("shell") not in ("/usr/bin/zsh", "/usr/bin/bash", "/usr/bin/fish"):
+        p.append("system: shell")
+    if not sy.get("timezone") or not os.path.isfile(f"/usr/share/zoneinfo/{sy['timezone']}"):
+        p.append("system: timezone (e.g. Europe/Berlin)")
+    if not re.fullmatch(r"[a-zA-Z_]+\.UTF-8", sy.get("locale") or ""):
+        p.append("system: locale (e.g. en_US.UTF-8)")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", sy.get("keymap") or ""):
+        p.append("system: console keymap (e.g. us)")
+    if any(m not in HARDEN_MODULES for m in c.get("harden", [])):
+        p.append("hardening: unknown module")
+    if "desktop" in c["packages"]["groups"] and "graphics" not in c["packages"]["groups"]:
+        p.append("the desktop needs the graphics group (drivers, sound)")
+    if c.get("dotfiles") and "desktop" not in c["packages"]["groups"]:
+        p.append("the desktop configuration needs the desktop package group")
+    return p
+
+
+def load_config(path):
+    c = empty_config()
+    data = json.load(open(path))
+    if data.get("version") != VERSION:
+        raise Fail(f"{path}: made by another installer version")
+    for k, v in data.items():
+        if isinstance(c.get(k), dict) and isinstance(v, dict):
+            c[k].update({kk: vv for kk, vv in v.items() if kk in c[k]})
+        elif k in c:
+            c[k] = v
+    return c
+
+
+def config_dir():
+    """In the persistence when it's open (survives the reboot), else the RAM home (gone at shutdown)."""
+    priv = LIVE_HOME + "/Private"
+    if os.path.ismount(priv):
+        return priv + "/lacuna-installer", True
+    return LIVE_HOME + "/lacuna-installer", False
+
+
+def save_config(c, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(c, f, indent=2)
+        f.write("\n")
+    try:
+        os.chown(os.path.dirname(path), 1000, 1000)
+        os.chown(path, 1000, 1000)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- the machine
+def sh(cmd, data=None, check=True, env=None):
+    r = subprocess.run(cmd, input=data, capture_output=True, text=True, env=env)
+    if check and r.returncode != 0:
+        raise Fail(f"{cmd[0]}: {(r.stderr or r.stdout).strip().splitlines()[-1:] or r.returncode}")
+    return r
+
+
+def boot_disk():
+    try:
+        return "/dev/" + open("/run/lacuna/boot-disk").read().strip()
+    except OSError:
+        return None
+
+
+def disks():
+    """Internal disks you can install to (the boot stick and virtual devices left out)."""
+    out = json.loads(sh(["lsblk", "-J", "-b", "-d", "-o", "PATH,SIZE,MODEL,SERIAL,TYPE,TRAN,RM"]).stdout)
+    res = []
+    for d in out.get("blockdevices", []):
+        if d["type"] != "disk" or d["path"] == boot_disk() or re.match(r"/dev/(loop|zram|sr|ram)", d["path"]):
+            continue
+        res.append({"device": d["path"], "size": int(d["size"]), "model": (d.get("model") or "").strip(),
+                    "serial": (d.get("serial") or "").strip(), "tran": d.get("tran") or ""})
+    return res
+
+
+def partitions(disk):
+    out = json.loads(sh(["lsblk", "-J", "-b", "-o", "PATH,SIZE,FSTYPE,PARTTYPENAME,TYPE", disk]).stdout)
+    return [p for p in out["blockdevices"][0].get("children", []) if p["type"] == "part"]
+
+
+def gib(b):
+    return f"{b / (1 << 30):.1f} GiB"
+
+
+def setup_mode():
+    try:
+        return open("/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c", "rb").read()[4] == 1
+    except OSError:
+        return False
+
+
+def groups():
+    try:
+        return json.load(open(GROUPS_FILE))
+    except (OSError, ValueError):
+        return {}
+
+
+# ---------------------------------------------------------------- the install
+class Install:
+    """Runs the configuration. log(text) gets every step; secrets: luks, user, root (optional)."""
+
+    def __init__(self, c, secrets, log):
+        self.c, self.s, self.log = c, secrets, log
+
+    def run(self, cmd, data=None, env=None, check=True):
+        self.log("  $ " + " ".join(shlex.quote(x) for x in cmd))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=env)
+        if data is not None:
+            p.stdin.write(data)
+        p.stdin.close()
+        tail = []
+        for line in p.stdout:
+            line = line.rstrip()
+            tail = (tail + [line])[-5:]
+            self.log("    " + line)
+        if p.wait() != 0 and check:
+            raise Fail(f"{os.path.basename(cmd[0])} failed: {tail[-1] if tail else p.returncode}")
+        return p.returncode
+
+    def chroot(self, *cmd, data=None, env=None, check=True):
+        return self.run(["arch-chroot", MNT, *cmd], data=data, env=env, check=check)
+
+    def step(self, title):
+        self.log(f"\n==> {title}")
+
+    # -- the steps --
+    def all(self):
+        c = self.c
+        if check_config(c):
+            raise Fail("the configuration isn't complete: " + "; ".join(check_config(c)))
+        if os.geteuid() != 0:
+            raise Fail("needs root")
+        if c["boot"]["loader"] == "systemd-boot" and not os.path.isdir("/sys/firmware/efi"):
+            raise Fail("this machine didn't boot with UEFI: systemd-boot can't be installed (choose none)")
+        self.prepare_disk()
+        self.encrypt_and_format()
+        self.mount()
+        self.packages()
+        self.configure()
+        self.users()
+        self.boot()
+        self.extras()
+        self.harden()
+        self.images()
+        self.secureboot()
+        self.unlock_extras()
+        self.finish()
+
+    def prepare_disk(self):
+        d = self.c["disk"]
+        self.step(f"disk {d['device']}")
+        os.makedirs("/run/lacuna", exist_ok=True)
+        open("/run/lacuna/installing", "w").close()       # the read-only rule for internal disks steps aside
+        self.run(["blockdev", "--setrw", d["device"]])
+        for p in partitions(d["device"]):
+            self.run(["blockdev", "--setrw", p["path"]])
+        if d["mode"] == "guided":
+            self.run(["wipefs", "-a", d["device"]])
+            self.run(["sfdisk", "--wipe", "always", d["device"]],
+                     data=f"label: gpt\nsize={d['esp_size_mib']}MiB, type=uefi, name=EFI\ntype=linux, name=root\n")
+            self.run(["udevadm", "settle"])
+            parts = partitions(d["device"])
+            if len(parts) < 2:
+                raise Fail("the new partitions didn't show up")
+            self.esp, self.root = parts[0]["path"], parts[1]["path"]
+            for p in (self.esp, self.root):
+                self.run(["blockdev", "--setrw", p])
+            self.format_esp = True
+        else:
+            self.esp, self.root, self.format_esp = d["esp"], d["root"], bool(d["format_esp"])
+
+    def encrypt_and_format(self):
+        l, fs = self.c["luks"], self.c["filesystem"]
+        dev = self.root
+        if l["enabled"]:
+            self.step("encryption (LUKS2)")
+            self.run(["cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2", "--cipher", l["cipher"],
+                      "--key-size", str(l["key_size"]), "--pbkdf", l["pbkdf"], "--iter-time", str(l["iter_time_ms"]),
+                      "--key-file", "-", self.root], data=self.s["luks"])
+            self.run(["cryptsetup", "open", "--key-file", "-", self.root, "root"], data=self.s["luks"])
+            dev = "/dev/mapper/root"
+        self.dev = dev
+        self.step(f"filesystems ({fs})")
+        if self.format_esp:
+            self.run(["mkfs.fat", "-F", "32", "-n", "EFI", self.esp])
+        self.run({"xfs": ["mkfs.xfs", "-f"], "ext4": ["mkfs.ext4", "-F"], "btrfs": ["mkfs.btrfs", "-f"]}[fs] + [dev])
+        if fs == "btrfs":
+            os.makedirs(MNT, exist_ok=True)
+            self.run(["mount", dev, MNT])
+            for sv in ("@", "@home"):
+                self.run(["btrfs", "subvolume", "create", f"{MNT}/{sv}"])
+            self.run(["umount", MNT])
+
+    def mount(self):
+        self.step("mounting")
+        os.makedirs(MNT, exist_ok=True)
+        if self.c["filesystem"] == "btrfs":
+            self.run(["mount", "-o", "subvol=@", self.dev, MNT])
+            os.makedirs(MNT + "/home", exist_ok=True)
+            self.run(["mount", "-o", "subvol=@home", self.dev, MNT + "/home"])
+        else:
+            self.run(["mount", self.dev, MNT])
+        os.makedirs(MNT + "/boot", exist_ok=True)
+        self.run(["mount", self.esp, MNT + "/boot"])
+
+    def package_list(self):
+        c, g = self.c, groups()
+        pk = ["base", "linux-hardened", "linux-hardened-headers", "linux-firmware", "sof-firmware", "intel-ucode",
+              "amd-ucode", "mkinitcpio", "systemd-ukify", "sudo", "nano", "less", "man-db", "networkmanager",
+              "wireless-regdb", "dosfstools", FS_PKG[c["filesystem"]]]
+        if c["luks"]["enabled"]:
+            pk.append("cryptsetup")
+            if c["luks"]["tpm2"]:
+                pk.append("tpm2-tss")
+            if c["luks"]["fido2"]:
+                pk.append("libfido2")
+        if c["swap"]["kind"] == "zram":
+            pk.append("zram-generator")
+        if c["boot"]["secureboot"]:
+            pk.append("sbctl")
+        if c["login"] == "greetd":
+            pk += ["greetd", "greetd-tuigreet"]
+        pk.append(c["system"]["shell"].rsplit("/", 1)[1])
+        for name in c["packages"]["groups"]:
+            pk += g.get(name, {}).get("packages", [])
+        for m in c["harden"]:
+            pk += HARDEN_MODULES[m][1]
+        pk += c["packages"]["extra"]
+        seen = set()
+        return [p for p in pk if p and not (p in seen or seen.add(p))]
+
+    def packages(self):
+        self.step("packages")
+        if not os.path.isdir("/etc/pacman.d/gnupg") or not os.listdir("/etc/pacman.d/gnupg"):
+            self.log("  setting up the package signing keys (in RAM)")
+            self.run(["pacman-key", "--init"])
+            self.run(["pacman-key", "--populate", "archlinux"])
+        conf = "/run/lacuna/installer-pacman.conf"
+        base = open("/etc/pacman.conf").read()
+        with open(conf, "w") as f:
+            # the AUR packages (the shell, the VPN clients, ...) come from the copy of Lacuna's own repo on the
+            # stick; everything else from the Arch mirrors, through whatever network mode is in use
+            f.write(base.replace("[core]", f"[lacuna]\nSigLevel = Optional TrustAll\nServer = file://{REPO}\n\n[core]", 1))
+        self.run(["pacstrap", "-C", conf, "-K", MNT] + self.package_list())
+        self.run(["sh", "-c", f"genfstab -U {MNT} >> {MNT}/etc/fstab"])
+
+    def configure(self):
+        sy = self.c["system"]
+        self.step("system settings")
+        self.chroot("ln", "-sf", f"/usr/share/zoneinfo/{sy['timezone']}", "/etc/localtime")
+        self.chroot("hwclock", "--systohc", check=False)
+        loc = sy["locale"]
+        gen = open(f"{MNT}/etc/locale.gen").read()
+        gen = re.sub(rf"^#\s*({re.escape(loc)} UTF-8)", r"\1", gen, flags=re.M)
+        if not re.search(rf"^{re.escape(loc)} UTF-8", gen, re.M):
+            gen += f"\n{loc} UTF-8\n"
+        open(f"{MNT}/etc/locale.gen", "w").write(gen)
+        self.chroot("locale-gen")
+        open(f"{MNT}/etc/locale.conf", "w").write(f"LANG={loc}\n")
+        open(f"{MNT}/etc/vconsole.conf", "w").write(f"KEYMAP={sy['keymap']}\n")
+        open(f"{MNT}/etc/hostname", "w").write(sy["hostname"] + "\n")
+        open(f"{MNT}/etc/hosts", "w").write(f"127.0.0.1 localhost\n::1 localhost\n127.0.1.1 {sy['hostname']}\n")
+        self.chroot("systemctl", "enable", "NetworkManager", "systemd-timesyncd")
+        if "graphics" in self.c["packages"]["groups"]:
+            self.chroot("systemctl", "enable", "bluetooth", check=False)
+        sw = self.c["swap"]
+        if sw["kind"] == "zram":
+            open(f"{MNT}/etc/systemd/zram-generator.conf", "w").write("[zram0]\nzram-size = ram / 2\n")
+        elif sw["kind"] == "swapfile":
+            if self.c["filesystem"] == "btrfs":
+                self.run(["btrfs", "subvolume", "create", f"{MNT}/swap"])     # its own subvolume: no snapshots of it
+                self.run(["btrfs", "filesystem", "mkswapfile", "--size", f"{sw['size_gib']}g", f"{MNT}/swap/swapfile"])
+                path = "/swap/swapfile"
+            else:
+                self.run(["dd", "if=/dev/zero", f"of={MNT}/swapfile", "bs=1M", f"count={sw['size_gib'] * 1024}"])
+                os.chmod(f"{MNT}/swapfile", 0o600)
+                self.run(["mkswap", f"{MNT}/swapfile"])
+                path = "/swapfile"
+            with open(f"{MNT}/etc/fstab", "a") as f:
+                f.write(f"{path} none swap defaults 0 0\n")
+
+    def users(self):
+        sy = self.c["system"]
+        self.step(f"user {sy['user']}")
+        self.chroot("useradd", "-m", "-G", "wheel", "-s", sy["shell"], sy["user"])
+        self.chroot("chpasswd", data=f"{sy['user']}:{self.s['user']}\n")
+        os.makedirs(f"{MNT}/etc/sudoers.d", exist_ok=True)
+        open(f"{MNT}/etc/sudoers.d/10-wheel", "w").write("%wheel ALL=(ALL:ALL) ALL\n")
+        os.chmod(f"{MNT}/etc/sudoers.d/10-wheel", 0o440)
+        if self.s.get("root"):
+            self.chroot("chpasswd", data=f"root:{self.s['root']}\n")
+        else:
+            self.chroot("passwd", "-l", "root")
+        if self.c["login"] == "greetd":
+            cmd = "niri-session" if "desktop" in self.c["packages"]["groups"] else sy["shell"]
+            open(f"{MNT}/etc/greetd/config.toml", "w").write(
+                '[terminal]\nvt = 1\n\n[default_session]\n'
+                f'command = "tuigreet --time --remember --asterisks --cmd {cmd}"\nuser = "greeter"\n')
+            self.chroot("systemctl", "enable", "greetd")
+
+    def uuid(self, dev):
+        return sh(["blkid", "-s", "UUID", "-o", "value", dev]).stdout.strip()
+
+    def boot(self):
+        c, l = self.c, self.c["luks"]
+        self.step("boot images (UKI)")
+        hooks = ["base", "systemd", "autodetect", "microcode", "modconf", "kms", "keyboard", "sd-vconsole", "block"]
+        if l["enabled"]:
+            hooks.append("sd-encrypt")
+        hooks += ["filesystems", "fsck"]
+        os.makedirs(f"{MNT}/etc/mkinitcpio.conf.d", exist_ok=True)
+        open(f"{MNT}/etc/mkinitcpio.conf.d/installer.conf", "w").write(f"HOOKS=({' '.join(hooks)})\n")
+        if l["enabled"]:
+            opts = []
+            if l["tpm2"]:
+                opts.append("tpm2-device=auto")
+            if l["fido2"]:
+                opts.append("fido2-device=auto")
+            cmd = f"rd.luks.name={self.uuid(self.root)}=root root=/dev/mapper/root"
+            if opts:
+                cmd += f" rd.luks.options={','.join(opts)}"
+        else:
+            cmd = f"root=UUID={self.uuid(self.dev)}"
+        if c["filesystem"] == "btrfs":
+            cmd += " rootflags=subvol=@"
+        os.makedirs(f"{MNT}/etc/kernel", exist_ok=True)
+        open(f"{MNT}/etc/kernel/cmdline", "w").write(cmd + " rw\n")
+        open(f"{MNT}/etc/mkinitcpio.d/linux-hardened.preset", "w").write(
+            'ALL_kver="/boot/vmlinuz-linux-hardened"\nPRESETS=(\'default\' \'fallback\')\n'
+            'default_uki="/boot/EFI/Linux/arch-linux-hardened.efi"\n'
+            'fallback_uki="/boot/EFI/Linux/arch-linux-hardened-fallback.efi"\nfallback_options="-S autodetect"\n')
+        os.makedirs(f"{MNT}/boot/EFI/Linux", exist_ok=True)
+
+    def extras(self):
+        c, sy = self.c, self.c["system"]
+        if not c["dotfiles"]:
+            return
+        self.step("desktop configuration (the rice)")
+        home = f"/home/{sy['user']}"
+        self.run(["cp", "-a", SKEL + "/.", MNT + home])
+        # the template was made for the live user: point it at this one
+        self.run(["sh", "-c", f"grep -rlI /home/amnesia {shlex.quote(MNT + home)} | xargs -r sed -i "
+                              f"'s|/home/amnesia|{home}|g'"])
+        self.chroot("chown", "-R", f"{sy['user']}:{sy['user']}", home)
+        # the dotfiles lock through lacuna-lock; here there is always a password, so it just locks
+        open(f"{MNT}/usr/local/bin/lacuna-lock", "w").write(
+            '#!/bin/sh\n# installed system: lock with caelestia\'s lock screen (the live system\'s no-password '
+            'rule does not apply)\n[ "${1:-}" = resume ] && exit 0\nexec caelestia shell lock lock\n')
+        os.chmod(f"{MNT}/usr/local/bin/lacuna-lock", 0o755)
+
+    def harden(self):
+        mods = self.c["harden"]
+        shutil.copy(HARDEN, f"{MNT}/usr/local/bin/harden")
+        os.chmod(f"{MNT}/usr/local/bin/harden", 0o755)
+        if not mods:
+            return
+        self.step("hardening: " + ", ".join(mods))
+        self.chroot("env", "HARDEN_NO_REBUILD=1", "/usr/local/bin/harden", "apply", *mods)
+        if os.path.islink(f"{MNT}/etc/resolv.conf.harden"):        # DNS: resolved's stub, now outside the chroot
+            os.replace(f"{MNT}/etc/resolv.conf.harden", f"{MNT}/etc/resolv.conf")
+
+    def images(self):
+        self.step("building the boot images")
+        b = self.c["boot"]
+        if b["secureboot"]:
+            self.chroot("sbctl", "create-keys")
+            # sign systemd-boot before bootctl installs it (bootctl takes the .signed copy)
+            self.chroot("sbctl", "sign", "-s", "-o", "/usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed",
+                        "/usr/lib/systemd/boot/efi/systemd-bootx64.efi")
+        self.chroot("mkinitcpio", "-P")
+        for f in os.listdir(f"{MNT}/boot"):
+            if f.startswith("initramfs-") and f.endswith(".img"):
+                os.remove(f"{MNT}/boot/{f}")                   # the UKIs carry their own
+        if b["loader"] == "systemd-boot":
+            self.chroot("bootctl", "install", "--esp-path=/boot")
+            os.makedirs(f"{MNT}/boot/loader", exist_ok=True)
+            open(f"{MNT}/boot/loader/loader.conf", "w").write("default arch-linux-hardened.efi\ntimeout 3\neditor no\n")
+            self.chroot("systemctl", "enable", "systemd-boot-update.service", check=False)
+
+    def secureboot(self):
+        b = self.c["boot"]
+        if not b["secureboot"]:
+            return
+        self.step("Secure Boot: signing")
+        self.chroot("/usr/local/bin/harden", "secureboot", "sign")
+        if b["enroll_now"] and setup_mode():
+            self.step("Secure Boot: enrolling the keys into the firmware")
+            self.chroot("/usr/local/bin/harden", "secureboot", "enroll", *(["--microsoft"] if b["microsoft_keys"] else []))
+        else:
+            self.log("  the keys aren't in the firmware yet. After the first boot: put the firmware in setup mode\n"
+                     "  (clear its Secure Boot keys), then run: sudo harden secureboot enroll"
+                     + (" --microsoft" if b["microsoft_keys"] else "") + "\n  and turn Secure Boot on.")
+
+    def unlock_extras(self):
+        l = self.c["luks"]
+        if not l["enabled"] or not (l["tpm2"] or l["fido2"]):
+            return
+        env = {**os.environ, "PASSWORD": self.s["luks"]}       # systemd-cryptenroll reads the passphrase from here
+        if l["tpm2"]:
+            self.step(f"TPM2 unlock (PCRs {l['tpm2_pcrs']})")
+            self.run(["systemd-cryptenroll", "--tpm2-device=auto", f"--tpm2-pcrs={l['tpm2_pcrs']}", self.root], env=env)
+            if "7" in l["tpm2_pcrs"].split("+") and self.c["boot"]["secureboot"]:
+                self.log("  PCR 7 changes when Secure Boot is turned on: afterwards re-enroll with\n"
+                         f"  sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs={l['tpm2_pcrs']} {self.root}")
+        if l["fido2"]:
+            self.step("FIDO2 unlock (touch the key when it blinks)")
+            self.run(["systemd-cryptenroll", "--fido2-device=auto", self.root], env=env)
+
+    def finish(self):
+        self.step("done: unmounting")
+        self.run(["sync"])
+        self.run(["umount", "-R", MNT], check=False)
+        if self.c["luks"]["enabled"]:
+            self.run(["cryptsetup", "close", "root"], check=False)
+        try:
+            os.remove("/run/lacuna/installing")
+        except FileNotFoundError:
+            pass
+        self.log("\nInstalled. Shut down, remove the stick, and start the machine.")
+
+
+def cleanup():
+    subprocess.run(["umount", "-R", MNT], capture_output=True)
+    subprocess.run(["cryptsetup", "close", "root"], capture_output=True)
+    try:
+        os.remove("/run/lacuna/installing")
+    except FileNotFoundError:
+        pass
+
+
+def summary(c):
+    d, l, b, sy = c["disk"], c["luks"], c["boot"], c["system"]
+    lines = [f"Disk:        {d['device']} {d.get('model') or ''} ({gib(d['size']) if d.get('size') else '?'}), "
+             + (f"guided: EFI {d['esp_size_mib']} MiB + the rest for the system" if d["mode"] == "guided"
+                else f"manual: EFI {d['esp']} ({'formatted' if d['format_esp'] else 'kept'}), system {d['root']}"),
+             "Encryption:  " + (f"LUKS2 {l['cipher']} {l['key_size']} bit, {l['pbkdf']} {l['iter_time_ms']} ms"
+                                + (f", TPM2 (PCRs {l['tpm2_pcrs']})" if l["tpm2"] else "") + (", FIDO2" if l["fido2"] else "")
+                                if l["enabled"] else "none"),
+             f"Filesystem:  {c['filesystem']}    Swap: {c['swap']['kind']}"
+             + (f" {c['swap']['size_gib']} GiB" if c["swap"]["kind"] == "swapfile" else ""),
+             f"Boot:        {b['loader']}" + (", Secure Boot (own keys" + (" + Microsoft" if b["microsoft_keys"] else "")
+                                               + (", enrolled now" if b["enroll_now"] else ", enrolled later") + ")"
+                                               if b["secureboot"] else ", no Secure Boot"),
+             f"Login:       {c['login']}",
+             f"System:      {sy['hostname']}, user {sy['user']} ({sy['shell']}), {sy['timezone']}, {sy['locale']}, "
+             f"keymap {sy['keymap']}",
+             f"Packages:    base + {', '.join(c['packages']['groups']) or 'nothing else'}"
+             + (f" + {' '.join(c['packages']['extra'])}" if c["packages"]["extra"] else ""),
+             f"Desktop configuration: {'the rice' if c['dotfiles'] else 'none'}",
+             f"Hardening:   {', '.join(c['harden']) or 'none'}"]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- headless replay
+def headless(path):
+    c = load_config(path)
+    have = {d["device"]: d for d in disks()}
+    d = c["disk"]
+    if d["serial"]:
+        match = [x for x in have.values() if x["serial"] == d["serial"]]
+        if match and match[0]["device"] != d["device"]:
+            print(f"(the disk with serial {d['serial']} is {match[0]['device']} now)")
+            d["device"] = match[0]["device"]
+    if d["device"] not in have:
+        raise Fail(f"no disk {d['device']} here (disks: {', '.join(have) or 'none'})")
+    d["size"] = have[d["device"]]["size"]
+    probs = check_config(c)
+    if probs:
+        raise Fail("the configuration isn't complete:\n  " + "\n  ".join(probs))
+    print(summary(c))
+    secrets = {}
+    def twice(what, allow_empty=False):
+        while True:
+            a = getpass.getpass(f"{what}: ")
+            if not a and allow_empty:
+                return None
+            if a and getpass.getpass("  again: ") == a:
+                return a
+            print("  empty or they don't match")
+    if c["luks"]["enabled"]:
+        secrets["luks"] = twice("Disk passphrase")
+    secrets["user"] = twice(f"Password for {c['system']['user']}")
+    secrets["root"] = twice("Root password (empty: root stays locked)", allow_empty=True)
+    name = os.path.basename(d["device"])
+    what = f"EVERYTHING on {d['device']} is erased" if d["mode"] == "guided" else "The partitions above are formatted"
+    if input(f"\n{what}. Type {name} to install: ").strip() != name:
+        print("Nothing changed."); return
+    try:
+        Install(c, secrets, print).all()
+    except Fail:
+        cleanup()
+        raise
+
+
+# ---------------------------------------------------------------- the TUI
+def tui():
+    from textual import on, work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+    from textual.screen import Screen
+    from textual.widgets import (Button, Footer, Input, Label, ListItem, ListView, RadioButton, RadioSet, RichLog,
+                                 Static, Switch)
+
+    class Step(Screen):
+        BINDINGS = [Binding("escape", "back", "Back"), Binding("ctrl+n", "next", "Continue", priority=True)]
+        TITLE = ""
+        HINT = ""
+
+        @property
+        def c(self):
+            return self.app.c
+
+        def action_back(self):
+            if len(self.app.screen_stack) > 2:
+                self.app.pop_screen()
+
+        def action_next(self):
+            self.go()
+
+        def head(self):
+            yield Label("lacuna installer", id="brand")
+            yield Label(self.TITLE, classes="title")
+            if self.HINT:
+                yield Label(self.HINT, classes="hint")
+
+        def buttons(self, next_label="Continue"):
+            with Horizontal(classes="buttons"):
+                yield Button("Back", id="back")
+                yield Button(next_label, variant="primary", id="go")
+            yield Label("", id="msg")
+
+        def fit_body(self):
+            """The scrolling middle gets exactly the rows the title, buttons and messages leave free, so it never
+            pushes them off the screen (and nested scrolling, which doesn't follow the focus well, isn't needed)."""
+            try:
+                body = self.query_one(".body")
+                card = self.query_one(".card")
+            except Exception:
+                return
+            rest = sum(w.outer_size.height for w in body.parent.children if w is not body and w.display)
+            chrome = card.styles.padding.top + card.styles.padding.bottom + 2          # padding + round border
+            free = self.size.height - 1 - chrome - rest                                # 1: the footer
+            body.styles.max_height = max(3, free)
+
+        def on_resize(self, event):
+            self.call_after_refresh(self.fit_body)
+
+        def on_screen_resume(self, event=None):
+            self.call_after_refresh(self.fit_body)
+
+        def say(self, text, error=False):
+            m = self.query_one("#msg", Label)
+            m.update(text)
+            m.set_class(error, "error")
+
+        @on(Button.Pressed, "#back")
+        def _back(self):
+            self.action_back()
+
+        @on(Button.Pressed, "#go")
+        def _go(self):
+            self.go()
+
+        def pressed(self, rid):
+            b = self.query_one("#" + rid, RadioSet).pressed_button
+            return b.name if b else None
+
+        def num(self, iid):
+            v = self.query_one("#" + iid, Input).value.strip()
+            return int(v) if v.isdigit() else None
+
+        def text(self, iid):
+            return self.query_one("#" + iid, Input).value.strip()
+
+        def radios(self, rid, options, current):
+            with RadioSet(id=rid):
+                for n, l in options:
+                    yield RadioButton(l, value=n == current, name=n)
+
+        def switch(self, sid, label, value):
+            with Horizontal(classes="row"):
+                yield Switch(value=bool(value), id=sid)
+                yield Label(label)
+
+        def field(self, fid, label, value, placeholder="", password=False):
+            yield Label(label, classes="sub")
+            yield Input(value="" if value is None else str(value), placeholder=placeholder, id=fid, password=password)
+
+    class Start(Step):
+        TITLE = "Install Arch (with the rice, if you want) on this machine"
+
+        def compose(self) -> ComposeResult:
+            d, persistent = config_dir()
+            files = sorted(f for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+            self.files = [os.path.join(d, f) for f in files]
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield Label(f"Saved configurations ({d}{'' if persistent else ': RAM, gone at shutdown; unlock the persistence to keep them'}):",
+                                    classes="hint")
+                        lv = ListView(*[ListItem(Label(os.path.basename(f))) for f in self.files], id="files")
+                        yield lv
+                        yield from self.field("path", "Or a configuration file:", "", "/path/to/config.json")
+                    with Horizontal(classes="buttons"):
+                        yield Button("Load", id="load")
+                        yield Button("New configuration", variant="primary", id="go")
+                    yield Label("", id="msg")
+            yield Footer()
+
+        def on_mount(self):
+            (self.query_one("#files") if self.files else self.query_one("#go")).focus()
+
+        @on(ListView.Selected)
+        @on(Button.Pressed, "#load")
+        @on(Input.Submitted, "#path")
+        def load(self):
+            i = self.query_one("#files", ListView).index
+            path = self.text("path") or (self.files[i] if self.files and i is not None else "")
+            if not path:
+                self.say("Pick a saved configuration or type a path.", error=True); return
+            try:
+                self.app.c = load_config(path)
+            except (OSError, ValueError, Fail) as e:
+                self.say(f"Couldn't load it: {e}", error=True); return
+            self.app.config_path = path
+            self.app.push_screen(Disk())
+
+        def go(self):
+            self.app.c = empty_config()
+            self.app.push_screen(Disk())
+
+    class Disk(Step):
+        TITLE = "Disk"
+        HINT = "The disk to install to. Guided erases it all; manual uses partitions you made (cfdisk in a terminal)."
+
+        def compose(self) -> ComposeResult:
+            d = self.c["disk"]
+            self.disks = disks()
+            have = [x for x in self.disks if x["serial"] and x["serial"] == d.get("serial")]
+            cur = have[0]["device"] if have else d.get("device")
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield from self.radios("disk", [(x["device"], f"{x['device']}  {gib(x['size'])}  {x['model']} {x['tran']}")
+                                                        for x in self.disks], cur)
+                        if not self.disks:
+                            yield Label("No internal disk found.", classes="warn")
+                        yield from self.radios("mode", [("guided", "Guided: erase the disk; an EFI partition + one for the system"),
+                                                        ("manual", "Manual: use existing partitions")], d.get("mode"))
+                        with Vertical(id="guided"):
+                            yield from self.field("esp_size", "EFI partition size (MiB)", d.get("esp_size_mib"), "e.g. 1024")
+                        with Vertical(id="manual"):
+                            yield from self.field("esp", "EFI partition", d.get("esp"), "/dev/nvme0n1p1")
+                            yield from self.switch("format_esp", "Format the EFI partition (off: keep other systems' loaders on it)",
+                                                   d.get("format_esp"))
+                            yield from self.field("root", "System partition (erased)", d.get("root"), "/dev/nvme0n1p2")
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.refresh_mode()
+            self.query_one("#disk").focus()
+
+        @on(RadioSet.Changed, "#mode")
+        def refresh_mode(self, *_):
+            m = self.pressed("mode")
+            self.query_one("#guided").display = m == "guided"
+            self.query_one("#manual").display = m == "manual"
+
+        def go(self):
+            d = self.c["disk"]
+            dev = self.pressed("disk")
+            x = next((x for x in self.disks if x["device"] == dev), None)
+            if not x:
+                self.say("Choose a disk.", error=True); return
+            d.update(device=dev, serial=x["serial"], model=x["model"], size=x["size"], mode=self.pressed("mode"))
+            if d["mode"] == "guided":
+                d.update(esp_size_mib=self.num("esp_size"), esp=None, root=None, format_esp=None)
+            elif d["mode"] == "manual":
+                d.update(esp=self.text("esp") or None, root=self.text("root") or None,
+                         format_esp=self.query_one("#format_esp", Switch).value, esp_size_mib=None)
+            probs = [p for p in check_config(self.c) if p.startswith("disk")]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(Crypt())
+
+    class Crypt(Step):
+        TITLE = "Encryption"
+
+        def compose(self) -> ComposeResult:
+            l = self.c["luks"]
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield from self.radios("enabled", [("yes", "LUKS2: the system partition is encrypted"),
+                                                           ("no", "No encryption")],
+                                               None if l.get("enabled") is None else ("yes" if l["enabled"] else "no"))
+                        with Vertical(id="opts"):
+                            yield from self.field("cipher", "Cipher", l.get("cipher"), "aes-xts-plain64")
+                            yield from self.radios("key_size", [("512", "512-bit key (AES-256 in XTS)"), ("256", "256-bit key")],
+                                                   str(l.get("key_size")) if l.get("key_size") else None)
+                            yield from self.radios("pbkdf", [("argon2id", "argon2id"), ("argon2i", "argon2i"),
+                                                             ("pbkdf2", "pbkdf2 (only for very old loaders)")], l.get("pbkdf"))
+                            yield from self.field("iter", "Time to unlock (ms): longer is harder to guess", l.get("iter_time_ms"), "e.g. 3000")
+                            yield from self.switch("tpm2", "Also unlock with this machine's TPM2 (no passphrase when nothing changed)", l.get("tpm2"))
+                            yield from self.field("pcrs", "TPM2 PCRs", l.get("tpm2_pcrs"), "e.g. 7 (Secure Boot state) or 0+7")
+                            yield from self.switch("fido2", "Also unlock with a FIDO2 key (plug it in now)", l.get("fido2"))
+                            yield Label("The passphrase is asked for at the end; it is never saved.", classes="hint")
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.refresh_opts()
+            self.query_one("#enabled").focus()
+
+        @on(RadioSet.Changed, "#enabled")
+        def refresh_opts(self, *_):
+            self.query_one("#opts").display = self.pressed("enabled") == "yes"
+
+        def go(self):
+            l = self.c["luks"]
+            e = self.pressed("enabled")
+            l["enabled"] = None if e is None else e == "yes"
+            if l["enabled"]:
+                ks = self.pressed("key_size")
+                l.update(cipher=self.text("cipher") or None, key_size=int(ks) if ks else None, pbkdf=self.pressed("pbkdf"),
+                         iter_time_ms=self.num("iter"), tpm2=self.query_one("#tpm2", Switch).value,
+                         tpm2_pcrs=self.text("pcrs") or None, fido2=self.query_one("#fido2", Switch).value)
+            probs = [p for p in check_config(self.c) if p.startswith("encryption")]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(Fs())
+
+    class Fs(Step):
+        TITLE = "Filesystem and swap"
+
+        def compose(self) -> ComposeResult:
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield from self.radios("fs", [("xfs", "xfs"), ("ext4", "ext4"), ("btrfs", "btrfs (subvolumes @ and @home)")],
+                                               self.c.get("filesystem"))
+                        yield Label("Swap (no hibernation either way)", classes="sub")
+                        yield from self.radios("swap", [("none", "None"), ("zram", "zram (compressed, in RAM)"),
+                                                        ("swapfile", "A swap file on the disk")], self.c["swap"].get("kind"))
+                        yield from self.field("swapsize", "Swap file size (GiB)", self.c["swap"].get("size_gib"), "e.g. 8")
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#fs").focus()
+
+        def go(self):
+            self.c["filesystem"] = self.pressed("fs")
+            self.c["swap"] = {"kind": self.pressed("swap"),
+                              "size_gib": self.num("swapsize") if self.pressed("swap") == "swapfile" else None}
+            probs = [p for p in check_config(self.c) if p.startswith(("filesystem", "swap"))]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(Boot())
+
+    class Boot(Step):
+        TITLE = "Boot and login"
+
+        def compose(self) -> ComposeResult:
+            b = self.c["boot"]
+            yn = lambda v: None if v is None else ("yes" if v else "no")
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield from self.radios("loader", [("systemd-boot", "systemd-boot, booting signed unified kernel images (UKIs)"),
+                                                          ("none", "None: I'll set up a boot loader myself")], b.get("loader"))
+                        yield Label("Secure Boot with your own keys (made now, on the new system)", classes="sub")
+                        yield from self.radios("sb", [("yes", "Yes: sign everything with new keys"), ("no", "No")], yn(b.get("secureboot")))
+                        yield from self.switch("ms", "Also trust Microsoft's keys (needed by most graphics cards' and some "
+                                                     "firmware's own code; without them some machines don't start)", b.get("microsoft_keys"))
+                        yield from self.switch("enroll", "Put the keys into the firmware now" + (
+                            "" if setup_mode() else " (needs setup mode: not now, after the first boot instead)"),
+                            b.get("enroll_now") and setup_mode())
+                        yield Label("Login", classes="sub")
+                        yield from self.radios("login", [("greetd", "A login screen (greetd + tuigreet)"),
+                                                         ("console", "The text console (start niri-session yourself)")],
+                                               self.c.get("login"))
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#loader").focus()
+
+        def go(self):
+            sb = self.pressed("sb")
+            self.c["boot"] = {"loader": self.pressed("loader"), "secureboot": None if sb is None else sb == "yes",
+                              "microsoft_keys": self.query_one("#ms", Switch).value,
+                              "enroll_now": self.query_one("#enroll", Switch).value}
+            self.c["login"] = self.pressed("login")
+            probs = [p for p in check_config(self.c) if p.startswith(("boot", "login"))]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(Packages())
+
+    class Packages(Step):
+        TITLE = "Packages"
+        HINT = "The base system is always there (kernel, firmware, NetworkManager, sudo). Add what you want."
+
+        def compose(self) -> ComposeResult:
+            self.g = groups()
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        for name, info in self.g.items():
+                            yield from self.switch(f"g_{name}".replace("-", "_"),
+                                                   f"{info['title']}  ({len(info['packages'])} packages)",
+                                                   name in self.c["packages"]["groups"])
+                        yield from self.switch("dotfiles", "The desktop configuration (the rice's dotfiles) for the new user",
+                                               self.c.get("dotfiles"))
+                        yield from self.field("extra", "More packages (space-separated)", " ".join(self.c["packages"]["extra"]), "")
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            sw = self.query(Switch)
+            if sw:
+                sw.first().focus()
+
+        def go(self):
+            self.c["packages"] = {"groups": [n for n in self.g if self.query_one(f"#g_{n}".replace("-", "_"), Switch).value],
+                                  "extra": [p for p in self.text("extra").split() if re.fullmatch(r"[a-z0-9@._+-]+", p)]}
+            self.c["dotfiles"] = self.query_one("#dotfiles", Switch).value
+            probs = [p for p in check_config(self.c) if "desktop" in p or "graphics" in p]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(System())
+
+    class System(Step):
+        TITLE = "System"
+
+        def compose(self) -> ComposeResult:
+            sy = self.c["system"]
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield from self.field("hostname", "Hostname", sy.get("hostname"), "")
+                        yield from self.field("user", "User name", sy.get("user"), "")
+                        yield from self.radios("shell", [("/usr/bin/zsh", "zsh"), ("/usr/bin/bash", "bash"), ("/usr/bin/fish", "fish")],
+                                               sy.get("shell"))
+                        yield from self.field("tz", "Timezone", sy.get("timezone"), "Region/City, e.g. Europe/Berlin")
+                        yield from self.field("locale", "Language (locale)", sy.get("locale"), "e.g. en_US.UTF-8")
+                        yield from self.field("keymap", "Console keymap", sy.get("keymap"), "e.g. us, de, fr")
+                        yield Label("Passwords are asked for at the end; they are never saved.", classes="hint")
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#hostname").focus()
+
+        def go(self):
+            self.c["system"] = {"hostname": self.text("hostname") or None, "user": self.text("user") or None,
+                                "shell": self.pressed("shell"), "timezone": self.text("tz") or None,
+                                "locale": self.text("locale") or None, "keymap": self.text("keymap") or None}
+            probs = [p for p in check_config(self.c) if p.startswith("system")]
+            if probs:
+                self.say(probs[0], error=True); return
+            self.app.push_screen(Harden())
+
+    class Harden(Step):
+        TITLE = "Hardening (harden)"
+        HINT = "Each can be changed later with `sudo harden MODULE on|off`."
+
+        def compose(self) -> ComposeResult:
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        for m, (desc, _) in HARDEN_MODULES.items():
+                            yield from self.switch(f"h_{m}", desc, m in self.c["harden"])
+                    yield from self.buttons()
+            yield Footer()
+
+        def on_mount(self):
+            self.query(Switch).first().focus()
+
+        def go(self):
+            self.c["harden"] = [m for m in HARDEN_MODULES if self.query_one(f"#h_{m}", Switch).value]
+            self.app.push_screen(Review())
+
+    class Review(Step):
+        TITLE = "Review"
+
+        def compose(self) -> ComposeResult:
+            d, persistent = config_dir()
+            path = getattr(self.app, "config_path", None) or f"{d}/{self.c['system']['hostname'] or 'install'}.json"
+            probs = check_config(self.c)
+            with Center(classes="card"):
+                with Vertical():
+                    yield from self.head()
+                    with VerticalScroll(classes="body"):
+                        yield Static(summary(self.c) if not probs else "Not complete:\n  " + "\n  ".join(probs), id="sum")
+                        yield from self.field("path", "Save this configuration as", path)
+                        yield Button("Save", id="save")
+                        if not persistent:
+                            yield Label("Not in the persistence: it's gone at shutdown unless you save it elsewhere.", classes="warn")
+                        if self.c["luks"]["enabled"]:
+                            yield from self.field("luks1", "Disk passphrase", "", password=True)
+                            yield from self.field("luks2", "Disk passphrase again", "", password=True)
+                        yield from self.field("pw1", f"Password for {self.c['system']['user']}", "", password=True)
+                        yield from self.field("pw2", "Again", "", password=True)
+                        yield from self.field("root", "Root password (empty: root stays locked)", "", password=True)
+                        name = os.path.basename(self.c["disk"]["device"] or "")
+                        yield from self.field("confirm", (f"EVERYTHING on {self.c['disk']['device']} is erased. " if self.c["disk"]["mode"] == "guided"
+                                                          else "The partitions above are formatted. ") + f"Type {name} to install", "")
+                    yield from self.buttons("Install")
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#save").focus()
+
+        @on(Button.Pressed, "#save")
+        def save(self):
+            try:
+                save_config(self.c, self.text("path"))
+                self.app.config_path = self.text("path")
+                self.say(f"Saved {self.text('path')} (no passwords in it).")
+            except OSError as e:
+                self.say(f"Couldn't save: {e}", error=True)
+
+        def go(self):
+            probs = check_config(self.c)
+            if probs:
+                self.say(probs[0], error=True); return
+            secrets = {}
+            if self.c["luks"]["enabled"]:
+                a, b = self.text("luks1"), self.text("luks2")
+                if not a or a != b:
+                    self.say("Type the same disk passphrase twice.", error=True); return
+                secrets["luks"] = a
+            a, b = self.text("pw1"), self.text("pw2")
+            if not a or a != b:
+                self.say("Type the same user password twice.", error=True); return
+            secrets["user"] = a
+            secrets["root"] = self.text("root") or None
+            if self.text("confirm") != os.path.basename(self.c["disk"]["device"]):
+                self.say("Type the disk's name to confirm.", error=True); return
+            for f in ("luks1", "luks2", "pw1", "pw2", "root"):
+                try:
+                    self.query_one("#" + f, Input).value = ""
+                except Exception:
+                    pass
+            self.app.push_screen(Progress(secrets))
+
+    class Progress(Screen):
+        BINDINGS = []
+
+        def __init__(self, secrets):
+            super().__init__()
+            self.secrets = secrets
+
+        def compose(self) -> ComposeResult:
+            with Vertical(classes="full"):
+                yield Label("lacuna installer: installing", id="brand")
+                yield RichLog(id="log", wrap=True, markup=False)
+                with Horizontal(classes="buttons"):
+                    yield Button("Close", variant="primary", id="close", disabled=True)
+            yield Footer()
+
+        def on_mount(self):
+            self.work_()
+
+        @work(thread=True)
+        def work_(self):
+            log = lambda t: self.app.call_from_thread(self.query_one("#log", RichLog).write, t)
+            try:
+                Install(self.app.c, self.secrets, log).all()
+                ok = True
+            except Exception as e:
+                log(f"\nFAILED: {e}\nNothing more was done; the disk may be half-installed. Fix it and run again.")
+                cleanup()
+                ok = False
+            self.secrets = None
+            self.app.call_from_thread(self.done, ok)
+
+        def done(self, ok):
+            b = self.query_one("#close", Button)
+            b.disabled = False
+            b.focus()
+
+        @on(Button.Pressed, "#close")
+        def close(self):
+            self.app.exit()
+
+    class Installer(App):
+        ENABLE_COMMAND_PALETTE = False
+        CSS = """
+        Screen { align: center middle; }
+        .card { width: 96; max-width: 98%; height: auto; max-height: 96%; padding: 1 2; border: round $primary 60%; }
+        .card > Vertical { height: auto; max-height: 100%; overflow-y: auto; scrollbar-size-vertical: 1; }
+        .body { height: auto; max-height: 65vh; scrollbar-size-vertical: 1; }
+        .full { height: 100%; padding: 1 2; }
+        /* sections inside a scrolling middle grow with their content (a plain Vertical would take a
+           share of the space instead, and then nothing scrolls) */
+        .body Vertical, .body Horizontal { height: auto; }
+        #log { height: 1fr; border: round $primary 30%; }
+        #brand { color: $primary; text-style: bold; }
+        .title { text-style: bold; margin: 1 0 0 0; }
+        .sub { text-style: bold; margin: 1 0 0 0; }
+        .hint { color: $text-muted; margin: 0 0 1 0; }
+        .warn { color: $warning; }
+        .row { height: auto; margin: 1 0 0 0; }
+        .row Label { padding: 1 1; width: 1fr; }
+        Label { width: 100%; }
+        .buttons { height: auto; margin: 1 0 0 0; align-horizontal: right; }
+        .buttons Button { margin: 0 0 0 1; }
+        #files { height: auto; max-height: 8; }
+        #msg { margin: 1 0 0 0; }
+        #msg.error { color: $error; }
+        Input { margin: 0 0 0 0; }
+        """
+        c = None
+
+        def on_mount(self):
+            self.theme = "textual-dark"
+            self.c = empty_config()
+            self.push_screen(Start())
+
+    Installer().run()
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", os.path.realpath(sys.argv[0])] + sys.argv[1:])
+    args = sys.argv[1:]
+    try:
+        if args[:1] == ["--config"] and len(args) == 2:
+            headless(args[1])
+        elif not args:
+            tui()
+        else:
+            print(__doc__); return 2
+    except Fail as e:
+        print(f"installer: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        cleanup()
+        print("\ninstaller: stopped", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

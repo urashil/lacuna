@@ -1,0 +1,14 @@
+#!/bin/sh
+# greeter-loop: keeps lacuna-greeter on screen in the greeter session. A crash is shown (and logged to the journal)
+# instead of leaving an empty niri; Enter starts it again.
+# Textual draws on stderr, so stderr must stay on the terminal (redirecting it gave a blank window). Its traceback
+# is printed there after it leaves full-screen mode.
+while :; do
+    foot -c /usr/share/lacuna/greeter/foot.ini -a lacuna-greeter sh -c '
+        /usr/local/bin/lacuna-greeter; rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "lacuna-greeter exited with status $rc" | systemd-cat -t lacuna-greeter 2>/dev/null
+            printf "\nThe greeter stopped (exit %s). Press Enter to start it again. " "$rc"; read -r _
+        fi'
+    sleep 1
+done

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+build() {
+    add_binary pv
+    add_runscript
+}
+
+help() {
+    echo "Copy-to-RAM progress for the archiso hook (Plymouth bar, or pv on the console). Put it right after archiso."
+}

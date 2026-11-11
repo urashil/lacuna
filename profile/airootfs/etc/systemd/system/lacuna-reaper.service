@@ -1,0 +1,11 @@
+[Unit]
+Description=Wipe and power off after 6 hours locked or away (reaper)
+After=lacuna-stickwatch.service systemd-logind.service
+
+[Service]
+ExecStart=/usr/local/lib/lacuna/reaper watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

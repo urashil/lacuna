@@ -1,0 +1,20 @@
+// opsec session bar
+{
+  "layer": "top",
+  "position": "top",
+  "height": 28,
+  "modules-left": ["custom/apps", "wlr/taskbar"],
+  "modules-center": ["clock"],
+  "modules-right": ["custom/tor", "pulseaudio", "battery", "custom/lock", "custom/power"],
+  "custom/apps": { "format": "  Apps", "on-click": "sh -c 'XDG_DATA_DIRS=$LACUNA_OPSEC_SHARE fuzzel'", "tooltip": false },
+  "wlr/taskbar": { "format": "{icon} {title:.24}", "icon-size": 16, "on-click": "activate", "on-click-middle": "close" },
+  "clock": { "format": "{:%a %d %b  %H:%M}", "tooltip": false },
+  "custom/tor": {
+    "exec": "sh -c 'p=$(grep -o \"Bootstrapped [0-9]*%\" /var/log/tor/notices.log 2>/dev/null | tail -1 | grep -o \"[0-9]*\"); [ \"$p\" = 100 ] && echo \"Tor ✓\" || echo \"Tor ${p:-…}%\"'",
+    "interval": 10, "tooltip": false
+  },
+  "pulseaudio": { "format": "{volume}%", "format-muted": "muted", "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle" },
+  "battery": { "format": "{capacity}%" },
+  "custom/lock": { "format": "", "on-click": "lacuna-lock", "tooltip": false },
+  "custom/power": { "format": "⏻", "on-click": "systemctl poweroff", "tooltip": false }
+}

@@ -1,0 +1,120 @@
+# Lacuna CI (milestone 9): build the ISO on a fresh runner, on demand, on pushes to main, and once a day when
+# Tor Browser has a new release. Nothing here runs until the repo is on GitHub (its location isn't decided yet).
+#
+# Secrets (Settings > Secrets and variables > Actions), all optional:
+#   LACUNA_MOK_KEY, LACUNA_MOK_CRT   the Secure Boot MOK (work/keys/MOK.key / MOK.crt). Without them the runner
+#                                    makes a throwaway one, and sticks from that build need their own MOK enrolled.
+#   LACUNA_RELEASE_KEY               the release signing key (gpg --export-secret-keys --armor lacuna-release).
+#                                    Without it the ISO is signed with a throwaway key.
+# The ISO (~5 GiB) is larger than a GitHub release asset may be (2 GiB): it's kept as a workflow artifact for
+# 3 days, together with its .sha256, .sig and the public key.
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: "Arch Linux Archive date YYYY/MM/DD to pin packages to (empty: rolling)"
+        required: false
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      tb: ${{ steps.tb.outputs.version }}
+    steps:
+      - id: tb
+        run: echo "version=$(curl -fsSL https://aus1.torproject.org/torbrowser/update_3/release/downloads.json | jq -r .version)" >> "$GITHUB_OUTPUT"
+      - id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: tb-built
+          key: tb-built-${{ steps.tb.outputs.version }}
+          lookup-only: true
+      - id: decide
+        name: Build? (scheduled runs only when Tor Browser has a release not built yet)
+        run: |
+          if [ "${{ github.event_name }}" = schedule ] && [ "${{ steps.seen.outputs.cache-hit }}" = true ]; then
+            echo build=false >> "$GITHUB_OUTPUT"
+          else
+            echo build=true >> "$GITHUB_OUTPUT"
+          fi
+
+  iso:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    # a standard runner has little disk for this; set the repository variable LACUNA_RUNNER to a larger or
+    # self-hosted runner label if the build runs out of space
+    runs-on: ${{ vars.LACUNA_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lacuna
+      - name: Room on the runner (the build needs roughly 35 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+      - name: Host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libtalloc-dev git curl jq gnupg zstd squashfs-tools xorriso \
+            mtools dosfstools libarchive-tools python3 rsync
+      - name: proot, the Arch build root and the dotfiles
+        run: |
+          cd lacuna
+          sudo bash scripts/build-proot.sh
+          sudo mkdir -p ../work
+          curl -fsSL -o /tmp/bootstrap.tar.zst https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst
+          curl -fsSL -o /tmp/bootstrap.tar.zst.sig https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst.sig
+          gpg --auto-key-locate clear,wkd -v --locate-external-key pierre@archlinux.org
+          gpg --verify /tmp/bootstrap.tar.zst.sig /tmp/bootstrap.tar.zst
+          sudo tar --zstd -xf /tmp/bootstrap.tar.zst -C ../work
+          git clone -q https://github.com/urashil/niri.git ../dotfiles
+      - name: Keys
+        env:
+          MOK_KEY: ${{ secrets.LACUNA_MOK_KEY }}
+          MOK_CRT: ${{ secrets.LACUNA_MOK_CRT }}
+          RELEASE_KEY: ${{ secrets.LACUNA_RELEASE_KEY }}
+        run: |
+          sudo install -d -m 700 work/keys work/keys/gnupg
+          if [ -n "$MOK_KEY" ] && [ -n "$MOK_CRT" ]; then
+            printf '%s\n' "$MOK_KEY" | sudo tee work/keys/MOK.key >/dev/null
+            printf '%s\n' "$MOK_CRT" | sudo tee work/keys/MOK.crt >/dev/null
+            sudo chmod 600 work/keys/MOK.key
+          fi
+          if [ -n "$RELEASE_KEY" ]; then
+            printf '%s\n' "$RELEASE_KEY" | sudo GNUPGHOME=work/keys/gnupg gpg --batch --import
+          fi
+      - name: Build
+        env:
+          ARCH_SNAPSHOT: ${{ github.event.inputs.snapshot }}
+        run: |
+          cd lacuna
+          sudo --preserve-env=ARCH_SNAPSHOT ./build.sh buildroot aur airootfs iso
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lacuna-iso
+          retention-days: 3
+          compression-level: 0
+          path: |
+            work/out/*.iso
+            work/out/*.iso.sha256
+            work/out/*.iso.sig
+            work/out/lacuna-release-key.asc
+            work/out/TESTING.md
+      - name: Remember the Tor Browser version built
+        run: echo "${{ needs.check.outputs.tb }}" > tb-built
+      - uses: actions/cache/save@v4
+        with:
+          path: tb-built
+          key: tb-built-${{ needs.check.outputs.tb }}

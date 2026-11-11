@@ -1,0 +1,14 @@
+[Unit]
+Description=Raise kernel lockdown to integrity (after early module loading)
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# anything that must load unsigned code (out-of-tree modules, a kexec wipe image) goes before this unit
+ExecStart=/bin/sh -c 'echo integrity > /sys/kernel/security/lockdown'
+
+[Install]
+WantedBy=sysinit.target

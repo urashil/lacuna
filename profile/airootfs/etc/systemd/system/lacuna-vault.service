@@ -1,0 +1,16 @@
+[Unit]
+Description=Close the persistence at shutdown (after the session, before the system goes down)
+# stopping runs in reverse order: the session (user@1000, session scopes: After=systemd-user-sessions) is gone
+# before this unit's ExecStop, so nothing holds files in the vault any more
+Before=systemd-user-sessions.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/bin/vault close
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

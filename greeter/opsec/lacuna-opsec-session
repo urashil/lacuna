@@ -1,0 +1,29 @@
+#!/bin/sh
+# lacuna-opsec-session: the opsec session (started by greetd instead of niri-session). labwc, a small floating
+# Wayland desktop, with waybar and fuzzel; nothing autostarts but the desktop itself. The launcher offers only:
+# Tor Browser, a terminal, Thunar, KeePassXC, Lacuna Settings and Persistence, plus the apps enabled in the greeter
+# (/run/lacuna-opsec-apps), each started through torapp (its own Tor circuits).
+set -u
+D=/usr/share/lacuna/opsec
+share="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/opsec/share"
+rm -rf "$share"; mkdir -p "$share/applications"
+# the launcher only sees this folder (fuzzel gets it as its XDG_DATA_DIRS); icons and themes come from /usr/share
+for d in icons pixmaps themes; do ln -s "/usr/share/$d" "$share/$d"; done
+for f in tor-browser.desktop foot.desktop thunar.desktop org.keepassxc.KeePassXC.desktop \
+         lacuna-settings.desktop persistence.desktop; do
+    [ -f "/usr/share/applications/$f" ] && cp "/usr/share/applications/$f" "$share/applications/"
+done
+if [ -r /run/lacuna-opsec-apps ]; then
+    while read -r name; do
+        line=$(torapp --list | grep "^$name|") || continue
+        desktop=$(printf '%s' "$line" | cut -d'|' -f2)
+        [ -f "/usr/share/applications/$desktop" ] || continue
+        # the same entry, but started through torapp (and only its first action: no hidden extra commands)
+        sed -n '/^\[Desktop Entry\]/,/^\[/p' "/usr/share/applications/$desktop" | grep -v '^\[Desktop Action' |
+            sed -E "s|^Exec=.*|Exec=torapp $name|; /^TryExec=/d; /^DBusActivatable=/d" > "$share/applications/$desktop"
+    done < /run/lacuna-opsec-apps
+fi
+export XDG_CURRENT_DESKTOP=labwc:wlroots XDG_SESSION_DESKTOP=labwc LACUNA_SESSION=opsec
+export LACUNA_OPSEC_SHARE="$share"
+# a session of its own under systemd --user would be nicer; labwc is enough here and runs everything below itself
+exec labwc -C "$D/labwc"

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# flash: write a Lacuna ISO to a USB stick and fill everything after it with random data (PLAN section 5).
+# The random fill is what makes a persistence on the stick deniable: with it, a stick with a vault and one without
+# look the same. Runs on any Linux with bash, coreutils and util-linux; as root.
+#
+#   flash lacuna.iso /dev/sdX            new stick: ISO + random fill of the rest (a slow stick takes a while)
+#   flash --update lacuna.iso /dev/sdX   new system, KEEP the persistence: rewrites only the first 8 GiB
+#                                        (the ISO plus random up to where the vault starts)
+set -euo pipefail
+VAULT_OFFSET=$((8 << 30))                 # same as vault's OFFSET: the ISO area ends here, the vault starts here
+die() { echo "flash: $*" >&2; exit 1; }
+
+update=0
+[[ ${1:-} == --update ]] && { update=1; shift; }
+[[ $# -eq 2 ]] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+iso=$1 dev=$2
+[[ $EUID -eq 0 ]] || die "run it as root"
+[[ -f $iso ]] || die "$iso: no such file"
+[[ -b $dev ]] || die "$dev: not a block device"
+[[ $(lsblk -dno TYPE "$dev") == disk ]] || die "$dev is a partition; give the whole stick (e.g. /dev/sdb)"
+name=$(basename "$dev")
+[[ $(cat "/sys/block/$name/removable" 2>/dev/null) == 1 ]] || lsblk -dno TRAN "$dev" | grep -qx usb ||
+    die "$dev doesn't look like a USB stick (not removable, not USB); refusing"
+if lsblk -no MOUNTPOINTS "$dev" | grep -q .; then die "$dev has mounted partitions; unmount them first"; fi
+
+isosize=$(stat -c %s "$iso")
+size=$(( $(cat "/sys/block/$name/size") * 512 ))
+(( isosize <= VAULT_OFFSET )) || die "the ISO is bigger than 8 GiB"
+(( size >= VAULT_OFFSET + (1 << 30) )) || echo "flash: note: under 9 GiB, this stick has no room for persistence"
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+
+echo "$dev: $(lsblk -dno VENDOR,MODEL "$dev" | xargs) ($(gib "$size"))"
+if ((update)); then
+    echo "Writes the ISO and random data up to 8 GiB. The persistence after that is kept."
+else
+    echo "EVERYTHING ON IT IS ERASED: the ISO, then random data to the end ($(gib $((size - isosize))))."
+fi
+read -r -p 'Type "yes" to continue: ' a
+[[ $a == yes ]] || { echo "Nothing written."; exit 0; }
+
+echo "Writing the ISO..."
+dd if="$iso" of="$dev" bs=4M conv=fsync oflag=direct status=progress
+end=$size
+((update)) && (( end > VAULT_OFFSET )) && end=$VAULT_OFFSET
+# from the very end of the ISO, so no zeros are left anywhere after it
+echo "Random data from $(gib "$isosize") to $(gib "$end")..."
+dd if=/dev/urandom of="$dev" bs=4M seek="$isosize" count=$((end - isosize)) \
+    oflag=seek_bytes iflag=count_bytes,fullblock conv=fsync status=progress
+sync
+echo "Done. $dev can be removed."

@@ -1,0 +1,53 @@
+#!/usr/bin/ash
+# Runs after the archiso hook and replaces its _mnt_fs: the same copy-to-RAM, but with progress.
+# With the Plymouth splash up, pv's percentage goes to the theme as "lacuna-progress:<n>" messages (drawn as a bar);
+# without it (troubleshooting entry), pv draws its usual bar on the console.
+
+run_hook() { :; }
+
+# stickless mode: everything is in RAM and archiso has unmounted the stick by the time late hooks run
+run_latehook() {
+    case " $(cat /proc/cmdline) " in
+        *" lacuna.stickless "*)
+            if [ "${copytoram}" = "y" ] && ! grep -q ' /run/archiso/bootmnt ' /proc/mounts; then
+                if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+                    plymouth display-message --text="lacuna-note:stick-free"
+                else
+                    msg ":: Lacuna is running from RAM: you can remove the USB stick now."
+                fi
+            fi ;;
+    esac
+}
+
+_mnt_fs() {
+    local img="${1}" mnt="${2}" img_fullname="${1##*/}" img_loopdev rc=0
+
+    # shellcheck disable=SC2154  # set by the archiso hook from the command line
+    if [ "${copytoram}" = "y" ]; then
+        local dst="/run/archiso/copytoram/${img_fullname}"
+        if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+            plymouth display-message --text="lacuna-progress:0"
+            { pv -n -i 0.25 "${img}" -o "${dst}"; echo "rc:$?"; } 2>&1 | while read -r line; do
+                case "${line}" in
+                    rc:*) echo "${line#rc:}" > /tmp/lacuna-copy-rc ;;
+                    *[!0-9]*|'') ;;
+                    *) plymouth display-message --text="lacuna-progress:${line}" ;;
+                esac
+            done
+            rc=$(cat /tmp/lacuna-copy-rc 2>/dev/null || echo 1)
+            plymouth display-message --text="lacuna-progress:done"
+        else
+            msg ":: Copying the system into RAM..."
+            pv "${img}" -o "${dst}"
+            rc=$?
+        fi
+        if [ "${rc}" != 0 ]; then
+            plymouth quit 2>/dev/null
+            echo "ERROR: while copying '${img}' to '${dst}'"
+            launch_interactive_shell
+        fi
+        img="${dst}"
+    fi
+    img_loopdev="$(losetup --find --show --read-only -- "${img}")"
+    _mnt_dev "${img_loopdev}" "${mnt}" "-r" "defaults"
+}

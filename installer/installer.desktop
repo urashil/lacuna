@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Install to this computer
+GenericName=Installer
+Comment=Install Arch (and the rice, if you want) on this machine's disk; every step asks
+Exec=foot -T Installer -a lacuna-installer sh -c 'sudo /usr/local/bin/installer; echo; read -r -p "Press Enter to close. " _'
+Icon=system-software-install
+Categories=System;
+Terminal=false
