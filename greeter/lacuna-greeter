@@ -103,10 +103,16 @@ class Step(Screen):
             card = self.query_one(".card")
         except Exception:
             return
-        rest = sum(w.outer_size.height for w in body.parent.children if w is not body and w.display)
+        rest = sum(w.outer_size.height + w.styles.margin.top + w.styles.margin.bottom
+                   for w in body.parent.children if w is not body and w.display)   # outer_size has no margins
         chrome = card.styles.padding.top + card.styles.padding.bottom + 2          # padding + round border
-        free = self.size.height - 1 - chrome - rest                                # 1: the footer
-        body.styles.max_height = max(3, free)
+        room = int((self.size.height - 1) * 0.96)                                  # the footer; the card's max-height
+        body.styles.max_height = max(3, room - chrome - rest - body.styles.margin.top - body.styles.margin.bottom)
+
+    def on_mount(self):
+        # again once the layout has settled: wrapped labels only get their real height after the first layout
+        self.call_after_refresh(self.fit_body)
+        self.set_timer(0.3, self.fit_body)
 
     def on_resize(self, event):
         self.call_after_refresh(self.fit_body)
@@ -599,6 +605,7 @@ class Apps(Step):
     def back(self):
         self.app.pop_screen()
 
+    @on(Button.Pressed, "#go")
     def go(self):
         apps = [n for n in self.names if self.query_one(f"#a_{n}", Switch).value]
         r = daemon("set_apps", apps=apps)
@@ -701,12 +708,12 @@ class SettingsHome(Step):
             with Vertical():
                 yield from self.head()
                 yield Label(where, classes="hint")
-                yield Button("Network: mode, bridges, PIA account", id="net")
+                yield Button("Network: mode, bridges, VPN account", id="net")
                 if st.get("session") != "opsec":
                     with Horizontal(classes="row"):
                         yield Switch(value=bool(st.get("unsafe")), id="unsafe")
                         yield Label("Unsafe Browser allowed (Wi-Fi sign-in pages, NOT anonymous)")
-                yield Button("Leak test: check that nothing gets out except the chosen way", id="leak")
+                yield Button("Leak test", id="leak")
                 if st.get("writable"):
                     yield Button("What the persistence keeps", id="features")
                 if not st.get("password_set"):
@@ -822,6 +829,7 @@ class LeakTest(Step):
     def inject(self):
         self.start(True)
 
+    @on(Button.Pressed, "#go")
     def go(self):
         self.start(False)
 

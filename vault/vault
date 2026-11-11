@@ -39,7 +39,12 @@ STATE = RUN + "/vault.json"
 MOUNTS = RUN + "/vault-mounts"      # for wipe (busybox): mount points, unmount top to bottom
 DMS = RUN + "/vault-dm"             # for wipe: device-mapper names, remove top to bottom
 LOOPS = RUN + "/vault-loops"
-USER, UID, GID = "amnesia", 1000, 1000
+USER = "amnesia"
+try:                                    # the live user's real ids (a package's group can take gid 1000 first)
+    import pwd as _pwd
+    UID, GID = _pwd.getpwnam(USER).pw_uid, _pwd.getpwnam(USER).pw_gid
+except KeyError:
+    UID, GID = 1000, 1000
 HOME = "/home/amnesia"
 DECOY_MNT = HOME + "/Persistent"
 PRIVATE = HOME + "/Private"

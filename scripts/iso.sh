@@ -5,6 +5,11 @@
 # forget every mkarchiso step except the three the airootfs stage did itself
 find "$ISOWORK" -maxdepth 1 -type f -name '*._*' ! -name 'base._make_custom_airootfs' ! -name 'base._make_packages' \
     ! -name 'base._make_customize_airootfs' -delete
+# mkarchiso keeps its first build date in $ISOWORK/build_date and reuses it forever: every ISO then had the same
+# date and the same boot UUID, so with two Lacuna media attached the initramfs could mount the wrong one's system.
+# A fresh date per build, unless SOURCE_DATE_EPOCH is set on purpose (reproducible releases).
+rm -f "$ISOWORK/build_date"
+[[ -n ${SOURCE_DATE_EPOCH:-} ]] && printf '%s\n' "$SOURCE_DATE_EPOCH" > "$ISOWORK/build_date"
 msg "iso: mkarchiso"
 # Secure Boot (scripts/secureboot.sh): mkarchiso puts systemd-boot at EFI/BOOT/BOOTX64.EFI; a patched copy puts
 # shim there instead, with the MOK-signed systemd-boot as grubx64.efi (what shim starts), MokManager, and the

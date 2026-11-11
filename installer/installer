@@ -138,9 +138,11 @@ def save_config(c, path):
         json.dump(c, f, indent=2)
         f.write("\n")
     try:
-        os.chown(os.path.dirname(path), 1000, 1000)
-        os.chown(path, 1000, 1000)
-    except OSError:
+        import pwd
+        u = pwd.getpwnam("amnesia")                     # the live user's real ids
+        os.chown(os.path.dirname(path), u.pw_uid, u.pw_gid)
+        os.chown(path, u.pw_uid, u.pw_gid)
+    except (OSError, KeyError):
         pass
 
 
@@ -638,10 +640,16 @@ def tui():
                 card = self.query_one(".card")
             except Exception:
                 return
-            rest = sum(w.outer_size.height for w in body.parent.children if w is not body and w.display)
+            rest = sum(w.outer_size.height + w.styles.margin.top + w.styles.margin.bottom
+                       for w in body.parent.children if w is not body and w.display)   # outer_size has no margins
             chrome = card.styles.padding.top + card.styles.padding.bottom + 2          # padding + round border
-            free = self.size.height - 1 - chrome - rest                                # 1: the footer
-            body.styles.max_height = max(3, free)
+            room = int((self.size.height - 1) * 0.96)                                  # the footer; the card's max-height
+            body.styles.max_height = max(3, room - chrome - rest - body.styles.margin.top - body.styles.margin.bottom)
+
+        def on_mount(self):
+            # again once the layout has settled: wrapped labels only get their real height after the first layout
+            self.call_after_refresh(self.fit_body)
+            self.set_timer(0.3, self.fit_body)
 
         def on_resize(self, event):
             self.call_after_refresh(self.fit_body)

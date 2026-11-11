@@ -38,7 +38,7 @@ if [[ -f $dst/.local/bin/lock ]]; then
 fi
 
 # what install.sh does in $HOME
-grep -rlI -e '@HOME@' "$dst" | xargs -r sed -i -e "s|@HOME@|$home|g"
+{ grep -rlI -e '@HOME@' "$dst" || true; } | xargs -r sed -i -e "s|@HOME@|$home|g"
 chmod +x "$dst"/.local/bin/* 2>/dev/null || true
 mkdir -p "$dst/Pictures/Screenshots" "$dst/Pictures/Wallpapers" "$dst/.cache/rice" "$dst/.config/rice"
 : > "$dst/.config/niri/larp.kdl"
