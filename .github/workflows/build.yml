@@ -67,7 +67,7 @@ jobs:
       - name: Host tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential libtalloc-dev git curl jq gnupg zstd squashfs-tools xorriso \
+          sudo apt-get install -y -qq build-essential gcc-multilib libtalloc-dev git curl jq gnupg zstd squashfs-tools xorriso \
             mtools dosfstools libarchive-tools python3 rsync
       - name: proot, the Arch build root and the dotfiles
         run: |
