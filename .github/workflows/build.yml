@@ -68,7 +68,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential gcc-multilib libtalloc-dev git curl jq gnupg zstd squashfs-tools xorriso \
-            mtools dosfstools libarchive-tools python3 rsync
+            mtools dosfstools libarchive-tools python3 rsync pacman-package-manager
       - name: proot, the Arch build root and the dotfiles
         run: |
           cd lacuna

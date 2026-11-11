@@ -7,8 +7,21 @@ source "$(dirname "$0")/scripts/common.sh"
 stage_buildroot() {
     msg "build root"
     [[ -x $BR/usr/bin/pacman ]] || die "no build root at $BR (extract the Arch bootstrap tarball there first)"
-    sed -i 's/^CheckSpace/#CheckSpace/; s/^#DisableSandbox$/DisableSandbox/; s/^#ParallelDownloads.*/ParallelDownloads = 8/' \
-        "$BR/etc/pacman.conf"
+    # under proot pacman can't drop to its download user (alpm) or set up its sandbox: both off
+    sed -i 's/^CheckSpace/#CheckSpace/; s/^#DisableSandbox$/DisableSandbox/; s/^DownloadUser/#DownloadUser/;
+            s/^#DisableSandboxFilesystem$/DisableSandboxFilesystem/; s/^#DisableSandboxSyscalls$/DisableSandboxSyscalls/;
+            s/^#ParallelDownloads.*/ParallelDownloads = 8/' "$BR/etc/pacman.conf"
+    # the package signing keys: set up with the host's pacman-key (gpg-agent hangs under proot), from the build
+    # root's own archlinux-keyring files
+    if [[ ! -s $BR/etc/pacman.d/gnupg/pubring.gpg ]]; then
+        command -v pacman-key >/dev/null ||
+            die "the host needs pacman-key (Arch/Alpine: pacman; Debian/Ubuntu: pacman-package-manager) for the build root's keyring"
+        install -d /usr/share/pacman/keyrings /usr/share/keyrings      # (Debian's pacman-key looks in the second)
+        cp -a "$BR/usr/share/pacman/keyrings/." /usr/share/pacman/keyrings/
+        cp -a "$BR"/usr/share/pacman/keyrings/archlinux* /usr/share/keyrings/
+        pacman-key --gpgdir "$BR/etc/pacman.d/gnupg" --init >/dev/null
+        pacman-key --gpgdir "$BR/etc/pacman.d/gnupg" --populate archlinux >/dev/null || die "could not populate the keyring"
+    fi
     grep -q '^\[lacuna\]' "$BR/etc/pacman.conf" || cat >> "$BR/etc/pacman.conf" <<'EOF'
 
 # local AUR builds (built on this machine, unsigned)
