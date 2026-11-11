@@ -55,13 +55,17 @@ msg "airootfs: anonium + sandbox"
 # expects at the rice-security path. Both come from the public part of rice-security (PLAN section 1: harden core).
 RICESEC=${RICESEC:-$(cd "$LACUNA/.." && pwd)/rice-security}
 ANONIUM=${ANONIUM:-$(cd "$LACUNA/.." && pwd)/anonium}
-[[ -f $ANONIUM && -f $RICESEC/bin/sandbox && -f $RICESEC/lib/sandbox-run ]] ||
-    die "anonium ($ANONIUM) or the sandbox tooling ($RICESEC) is missing"
-install -Dm755 "$ANONIUM" "$AIROOT/usr/local/bin/anonium"
-install -Dm755 "$RICESEC/bin/sandbox" "$AIROOT/usr/local/bin/sandbox"
-install -Dm755 "$RICESEC/lib/sandbox-run" "$AIROOT/usr/local/lib/rice-security/lib/sandbox-run"
-install -Dm644 "$RICESEC/lib/wl-secctx.py" "$AIROOT/usr/local/lib/rice-security/lib/wl-secctx.py"
-install -Dm644 "$RICESEC/polkit/org.rice.sandbox.policy" "$AIROOT/usr/share/polkit-1/actions/org.rice.sandbox.policy"
+# optional: both live outside this repo (the author's own tools); builds without them just leave Anonium out
+if [[ -f $ANONIUM && -f $RICESEC/bin/sandbox && -f $RICESEC/lib/sandbox-run ]]; then
+    install -Dm755 "$ANONIUM" "$AIROOT/usr/local/bin/anonium"
+    install -Dm755 "$RICESEC/bin/sandbox" "$AIROOT/usr/local/bin/sandbox"
+    install -Dm755 "$RICESEC/lib/sandbox-run" "$AIROOT/usr/local/lib/rice-security/lib/sandbox-run"
+    install -Dm644 "$RICESEC/lib/wl-secctx.py" "$AIROOT/usr/local/lib/rice-security/lib/wl-secctx.py"
+    install -Dm644 "$RICESEC/polkit/org.rice.sandbox.policy" "$AIROOT/usr/share/polkit-1/actions/org.rice.sandbox.policy"
+else
+    warn "anonium ($ANONIUM) or the sandbox tooling ($RICESEC) not found: Anonium left out"
+    rm -f "$AIROOT/usr/share/applications/anonium.desktop"
+fi
 
 msg "airootfs: Tor Browser"
 WORK=$WORK bash "$LACUNA/scripts/tor-browser.sh" "$AIROOT"
