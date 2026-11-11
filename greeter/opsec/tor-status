@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""tor-status: one line for the opsec bar, "Tor ✓" or "Tor 42%" (asks greeterd; the Tor log is root's)."""
+import json, socket
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect("/run/greeterd/greeterd.sock")
+    s.sendall(b'{"op": "gate_status"}\n')
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    p = json.loads(buf).get("tor_bootstrap")
+except (OSError, ValueError):
+    p = None
+print("Tor ✓" if p == 100 else f"Tor {p}%" if p is not None else "Tor …")

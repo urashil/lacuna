@@ -19,6 +19,7 @@ install -Dm755 "$G/lacuna-launch" "$AIROOT/usr/local/bin/lacuna-launch"
 O=$G/opsec
 install -Dm755 "$O/torapp"                "$AIROOT/usr/local/bin/torapp"
 install -Dm755 "$O/lacuna-opsec-session"  "$AIROOT/usr/local/bin/lacuna-opsec-session"
+install -Dm755 "$O/tor-status"              "$AIROOT/usr/share/lacuna/opsec/tor-status"
 install -Dm644 "$O/labwc/rc.xml"          "$AIROOT/usr/share/lacuna/opsec/labwc/rc.xml"
 install -Dm644 "$O/labwc/menu.xml"        "$AIROOT/usr/share/lacuna/opsec/labwc/menu.xml"
 install -Dm644 "$O/labwc/autostart"       "$AIROOT/usr/share/lacuna/opsec/labwc/autostart"

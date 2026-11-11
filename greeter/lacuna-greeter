@@ -227,11 +227,11 @@ class Options(Step):
                                 .get(self.app.persistence, "Persistence: not in use"), classes="hint")
                     yield Label("Session", classes="sub")
                     with RadioSet(id="session"):
-                        yield RadioButton("Normal: the full desktop (niri + caelestia), every app and network mode",
-                                          value=True, name="normal")
-                        yield RadioButton("Opsec: a minimal floating desktop (labwc). Tor only, each app on its own "
-                                          "circuits; no VPN, no Unsafe Browser; only Tor Browser, a terminal, files "
-                                          "and KeePassXC unless you add apps", name="opsec")
+                        yield RadioButton("Normal (niri + caelestia)", value=True, name="normal")
+                        yield RadioButton("Opsec (labwc, Tor only)", name="opsec")
+                    yield Label("Normal: the full desktop, every app and network mode. Opsec: a minimal floating "
+                                "desktop; Tor only, each app on its own circuits; no VPN, no Unsafe Browser; only Tor "
+                                "Browser, a terminal, files and KeePassXC unless you add apps.", classes="hint")
                     with Horizontal(classes="row"):
                         yield Switch(value=True, id="mac")
                         yield Label("Random network hardware address (MAC)  [recommended]")

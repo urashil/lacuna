@@ -10,7 +10,7 @@
   "wlr/taskbar": { "format": "{icon} {title:.24}", "icon-size": 16, "on-click": "activate", "on-click-middle": "close" },
   "clock": { "format": "{:%a %d %b  %H:%M}", "tooltip": false },
   "custom/tor": {
-    "exec": "sh -c 'p=$(grep -o \"Bootstrapped [0-9]*%\" /var/log/tor/notices.log 2>/dev/null | tail -1 | grep -o \"[0-9]*\"); [ \"$p\" = 100 ] && echo \"Tor ✓\" || echo \"Tor ${p:-…}%\"'",
+    "exec": "/usr/share/lacuna/opsec/tor-status",
     "interval": 10, "tooltip": false
   },
   "pulseaudio": { "format": "{volume}%", "format-muted": "muted", "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle" },
