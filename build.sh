@@ -72,6 +72,10 @@ stage_aur() {
 stage_airootfs() { source "$LACUNA/scripts/airootfs.sh"; }
 stage_iso()      { source "$LACUNA/scripts/iso.sh"; }
 
+# one block, read whole before it runs: editing this file during a build can't make bash carry on with half-new lines
+{
 stages=("$@"); ((${#stages[@]})) || stages=(buildroot aur airootfs iso)
 for s in "${stages[@]}"; do "stage_$s"; done
 msg "done: ${stages[*]}"
+exit 0
+}
