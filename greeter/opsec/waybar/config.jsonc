@@ -15,6 +15,6 @@
   },
   "pulseaudio": { "format": "{volume}%", "format-muted": "muted", "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle" },
   "battery": { "format": "{capacity}%" },
-  "custom/lock": { "format": "", "on-click": "lacuna-lock", "tooltip": false },
+  "custom/lock": { "format": "", "on-click": "lock", "tooltip": false },
   "custom/power": { "format": "⏻", "on-click": "systemctl poweroff", "tooltip": false }
 }

@@ -3,7 +3,7 @@
 # The clock runs while
 #   - nobody has started the session yet (the greeter, from boot on),
 #   - the session is locked (caelestia's lock, or swaylock), or
-#   - no password is set and the screens were blanked for being idle (lacuna-lock marks that; any input clears it).
+#   - no password is set and the screens were blanked for being idle (lock marks that; any input clears it).
 # Being in the session and unlocked stops and resets it. Nothing holds it off (no caffeine in Lacuna).
 # It fires by creating /run/lacuna/reap: stickwatch's watcher, outside the slices wipe freezes, runs the wipe.
 #   reaper watch     the service: check every 20 s

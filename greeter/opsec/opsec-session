@@ -1,7 +1,7 @@
 #!/bin/sh
-# lacuna-opsec-session: the opsec session (started by greetd instead of niri-session). labwc, a small floating
+# opsec-session: the opsec session (started by greetd instead of niri-session). labwc, a small floating
 # Wayland desktop, with waybar and fuzzel; nothing autostarts but the desktop itself. The launcher offers only:
-# Tor Browser, a terminal, Thunar, KeePassXC, Lacuna Settings and Persistence, plus the apps enabled in the greeter
+# Tor Browser, a terminal, Thunar, KeePassXC, Settings and Persistence, plus the apps enabled in the greeter
 # (/run/lacuna-opsec-apps), each started through torapp (its own Tor circuits).
 set -u
 D=/usr/share/lacuna/opsec
@@ -10,7 +10,7 @@ rm -rf "$share"; mkdir -p "$share/applications"
 # the launcher only sees this folder (fuzzel gets it as its XDG_DATA_DIRS); icons and themes come from /usr/share
 for d in icons pixmaps themes; do ln -s "/usr/share/$d" "$share/$d"; done
 for f in tor-browser.desktop foot.desktop thunar.desktop org.keepassxc.KeePassXC.desktop \
-         lacuna-settings.desktop persistence.desktop; do
+         settings.desktop persistence.desktop; do
     [ -f "/usr/share/applications/$f" ] && cp "/usr/share/applications/$f" "$share/applications/"
 done
 if [ -r /run/lacuna-opsec-apps ]; then

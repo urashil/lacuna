@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lacuna-greeter: the pre-session screens (PLAN section 3), a Textual TUI run as the unprivileged `greeter` user in
+"""greeter: the pre-session screens (PLAN section 3), a Textual TUI run as the unprivileged `greeter` user in
 a fullscreen foot inside the greeter's niri session.
 
   1 persistence passphrase  2 options (MAC, admin password)  3 Wi-Fi / Ethernet  4 network mode + bridges  5 start
@@ -64,7 +64,7 @@ def start_session(session="normal"):
         return "the login was refused (greeterd did not allow the hand-off)"
     if r.get("type") != "success":
         return r.get("description") or "greetd refused the session"
-    cmd = ["/usr/local/bin/lacuna-opsec-session"] if session == "opsec" else ["niri-session"]
+    cmd = ["/usr/local/bin/opsec-session"] if session == "opsec" else ["niri-session"]
     r = greetd({"type": "start_session", "cmd": cmd, "env": []})
     if r.get("type") != "success":
         return r.get("description") or "greetd could not start the session"
@@ -238,10 +238,14 @@ class Options(Step):
                     with Horizontal(classes="row", id="unsaferow"):
                         yield Switch(value=False, id="unsafe")
                         yield Label("Unsafe Browser: for Wi-Fi sign-in pages (hotels, cafés). NOT anonymous")
-                    yield Label("Admin and screen-lock password", classes="sub")
-                    yield Label("Optional. Without one there is no sudo, and the screen can't be locked.", classes="hint")
-                    yield Input(password=True, placeholder="password (empty: none)", id="pw1")
+                    yield Label("Password", classes="sub")
+                    yield Label("Required: it unlocks the lock screen. With admin rights on, it's also the sudo password.",
+                                classes="hint")
+                    yield Input(password=True, placeholder="password", id="pw1")
                     yield Input(password=True, placeholder="again", id="pw2")
+                    with Horizontal(classes="row"):
+                        yield Switch(value=False, id="admin")
+                        yield Label("Admin rights (sudo). Off: nothing in this session can become root")
                 with Horizontal(classes="buttons"):
                     yield Button("Back", id="back")
                     yield Button("Continue", variant="primary", id="go")
@@ -255,6 +259,7 @@ class Options(Step):
         if (st.get("saved_session") or st.get("session")) == "opsec":
             self.query_one("#session").query(RadioButton)[1].value = True
         self.session_changed()
+        self.query_one("#admin", Switch).value = bool(st.get("saved_admin") or st.get("admin"))
         if st.get("password_set"):
             self.query_one("#pw1", Input).placeholder = "a password is set (restored); type to replace it"
         self.query_one("#pw1", Input).focus()          # the MAC switch is one Shift+Tab away
@@ -284,10 +289,15 @@ class Options(Step):
         if a.value != b.value:
             self.say("The two passwords don't match.", error=True); return
         pw = a.value or None
+        if pw is None and not daemon("state").get("password_set"):
+            self.say("A password is needed: it unlocks the lock screen.", error=True); return
         a.value = b.value = ""
         r = daemon("set_mac", random=self.query_one("#mac", Switch).value)
         daemon("set_unsafe", on=self.query_one("#unsafe", Switch).value and self.app.session != "opsec")
-        if pw is not None or not daemon("state").get("password_set"):
+        r = daemon("set_admin", on=self.query_one("#admin", Switch).value)
+        if not r.get("ok"):
+            self.say(r.get("error") or "could not set admin rights", error=True); return
+        if pw is not None:
             r = daemon("set_password", password=pw)
             del pw
             if not r.get("ok"):
@@ -442,7 +452,7 @@ class Mode(Step):
                         yield RadioButton("Tor" + (" (each app on its own circuits; no other way out)" if opsec else ""),
                                           value=self.saved_kind == "tor", name="tor")
                         if not opsec:
-                            yield RadioButton("A VPN (UDP apps such as Spotify work; not anonymous to the VPN)",
+                            yield RadioButton("A VPN (not anonymous to the VPN; UDP apps work)",
                                               value=self.saved_kind == "vpn", name="vpn")
                             yield RadioButton("Tor over a VPN (hides Tor use from the local network)",
                                               value=self.saved_kind == "tor+vpn", name="tor+vpn")
@@ -690,10 +700,10 @@ class Start(Step):
             self.say("Starting…")
 
 
-# ---------- Lacuna Settings (lacuna-greeter --settings, in the session) ----------
+# ---------- Settings (greeter --settings, in the session) ----------
 class SettingsHome(Step):
     BINDINGS = [Binding("escape", "app.quit", "Close")]
-    TITLE = "Lacuna Settings"
+    TITLE = "Settings"
 
     def compose(self) -> ComposeResult:
         st = daemon("state")
@@ -716,8 +726,6 @@ class SettingsHome(Step):
                 yield Button("Leak test", id="leak")
                 if st.get("writable"):
                     yield Button("What the persistence keeps", id="features")
-                if not st.get("password_set"):
-                    yield Button("Set an admin password (none is set)", id="password")
                 with Horizontal(classes="buttons"):
                     yield Button("Close", variant="primary", id="close")
                 yield Label("", id="msg")
@@ -744,9 +752,6 @@ class SettingsHome(Step):
     def features(self):
         self.app.push_screen(Features())
 
-    @on(Button.Pressed, "#password")
-    def password(self):
-        self.app.push_screen(Password())
 
     @on(Button.Pressed, "#close")
     def close(self):
@@ -851,46 +856,6 @@ class LeakTest(Step):
                  ("No leaks." if good else "LEAK found: see above."), error=not good)
 
 
-class Password(Step):
-    TITLE = "Admin and screen-lock password"
-    HINT = "For sudo and the lock screen. Once set, it can only be changed at the next start."
-
-    def compose(self) -> ComposeResult:
-        with Center(classes="card"):
-            with Vertical():
-                yield from self.head()
-                yield Input(password=True, placeholder="password", id="pw1")
-                yield Input(password=True, placeholder="again", id="pw2")
-                with Horizontal(classes="buttons"):
-                    yield Button("Back", id="back")
-                    yield Button("Set", variant="primary", id="go")
-                yield Label("", id="msg")
-        yield Footer()
-
-    def on_mount(self):
-        self.query_one("#pw1").focus()
-
-    @on(Input.Submitted, "#pw1")
-    def next_field(self):
-        self.query_one("#pw2", Input).focus()
-
-    @on(Button.Pressed, "#back")
-    def back(self):
-        self.app.pop_screen()
-
-    @on(Input.Submitted, "#pw2")
-    @on(Button.Pressed, "#go")
-    def go(self):
-        a, b = self.query_one("#pw1", Input), self.query_one("#pw2", Input)
-        if not a.value or a.value != b.value:
-            self.say("Type the same password twice.", error=True); return
-        r = daemon("set_password", password=a.value)
-        a.value = b.value = ""
-        if not r.get("ok"):
-            self.say(r.get("error") or "could not set it", error=True); return
-        self.app.pop_screen()
-
-
 class Greeter(App):
     ENABLE_COMMAND_PALETTE = False                      # no Ctrl+P command palette in a greeter
     CSS = """
@@ -933,7 +898,7 @@ class Greeter(App):
     persistence = "none"
     mode = ""
     session = "normal"
-    settings = False                                    # True: Lacuna Settings in the session, not the greeter
+    settings = False                                    # True: Settings in the session, not the greeter
 
     def on_mount(self):
         try:

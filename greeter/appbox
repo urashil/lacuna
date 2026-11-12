@@ -19,7 +19,7 @@ case $app in
     tor-browser)    U=torbrowser dl="Tor Browser" ;;
     unsafe-browser) U=clearnet dl="Unsafe Browser"
                     [[ -e /run/lacuna/unsafe ]] || {
-                        echo "appbox: the Unsafe Browser wasn't allowed in the greeter (or Lacuna Settings)" >&2; exit 1; } ;;
+                        echo "appbox: the Unsafe Browser wasn't allowed in the greeter (or Settings)" >&2; exit 1; } ;;
     *) echo "appbox: unknown app" >&2; exit 1 ;;
 esac
 [[ -z $url || $url =~ ^https?://[[:graph:]]+$ ]] || { echo "appbox: bad URL" >&2; exit 1; }

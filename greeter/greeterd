@@ -8,7 +8,8 @@ requests only, are never written to argv, logs or disk, and are dropped as soon 
 Requests ("op"):
   state                              what the TUI needs to draw (vault, password, MAC, devices, mode)
   unlock        passphrase           try the vault; always answers the same way and takes the same time
-  set_password  password|null        admin + lock-screen password for `amnesia` (null: keep it locked)
+  set_password  password             the lock-screen (and, with admin rights, sudo) password for `amnesia`
+  set_admin     on                   admin rights (sudo) for this session: membership of wheel, applied at hand-off
   set_mac       random: bool         MAC randomization (default on; NICs already start randomized)
   wifi_scan                          visible networks
   wifi_connect  ssid, password|null  join a network (the key goes to NetworkManager through a pipe)
@@ -42,8 +43,9 @@ gate_job = {"mode": None, "running": False, "error": None}
 
 state = {"vault": "locked", "password_set": False, "mac_random": True, "mode": None, "bridges": [],
          "restricted": False, "unsafe": False, "saved_unsafe": False, "saved_mode": None,
-         "session": "normal", "saved_session": None, "apps": [], "saved_apps": [], "saved_bridges": [], "saved_restricted": False, "handed_off": False}
-# what the live user's session may ask for (Lacuna Settings); everything else is the greeter's alone
+         "session": "normal", "saved_session": None, "apps": [], "saved_apps": [], "saved_bridges": [], "saved_restricted": False, "handed_off": False,
+         "admin": False, "saved_admin": False}
+# what the live user's session may ask for (Settings); everything else is the greeter's alone
 SESSION_OPS = {"state", "gate_status", "set_mode", "features", "set_feature", "set_password", "launch", "set_unsafe",
                "leaktest"}   # not set_session / set_apps: those are decided before the session starts
 APPBOX = "/usr/local/lib/lacuna/appbox"
@@ -117,6 +119,8 @@ def restore_settings():
         state["saved_unsafe"] = s.get("unsafe") is True
         if s.get("session") in ("normal", "opsec"):
             state["saved_session"] = s["session"]
+        if isinstance(s.get("admin"), bool):
+            state["saved_admin"] = s["admin"]
         if isinstance(s.get("apps"), list):
             state["saved_apps"] = [a for a in s["apps"] if a in OPSEC_APPS]
 
@@ -146,7 +150,7 @@ def save_settings():
         return
     s = {"mac_random": state["mac_random"], "bridges": state["bridges"], "restricted": state["restricted"],
          "unsafe": state["unsafe"], "session": state["session"], "apps": state["apps"],
-         "password_hash": shadow_hash()}
+         "admin": state["admin"], "password_hash": shadow_hash()}
     if state["mode"] in MODES - {"direct"}:
         s["mode"] = state["mode"]
     if vpn_saved:                                       # only accounts that logged in (or were saved before)
@@ -167,7 +171,7 @@ def shadow_hash():
     return None
 
 
-FLAG = "/run/lacuna-password-set"       # world-readable: lacuna-lock only locks the screen when a password exists
+FLAG = "/run/lacuna-password-set"       # world-readable: lock only locks the screen when a password exists
 
 
 def publish_password_flag():
@@ -183,11 +187,8 @@ def publish_password_flag():
 
 
 def set_password(password):
-    if password is None:
-        run(["passwd", "-l", USER])
-        state["password_set"] = password_is_set()
-        publish_password_flag()
-        return {"ok": True}
+    if not password:
+        return {"ok": False, "error": "a password is needed (it unlocks the lock screen)"}
     if len(password) < 4 or "\n" in password or ":" in password:
         return {"ok": False, "error": "use at least 4 characters (no colon or line break)"}
     r = run(["chpasswd"], data=f"{USER}:{password}\n")
@@ -351,9 +352,16 @@ def gate_status():
     return {"ok": True, "applying": gate_job["running"], "wanted": gate_job["mode"], "error": gate_job["error"], **st}
 
 
+def apply_admin(on):
+    """sudo only for wheel (/etc/sudoers.d/10-wheel): the live user is in it only when admin rights were chosen."""
+    run(["gpasswd", "-a" if on else "-d", USER, "wheel"])
+
+
 def finish():
     if state["mode"] is None:
         return {"ok": False, "error": "choose a network mode first"}
+    if not password_is_set():
+        return {"ok": False, "error": "set a password first (it unlocks the lock screen)"}
     if gate_job["error"]:
         return {"ok": False, "error": "the network mode failed: " + gate_job["error"]}
     os.makedirs("/run/lacuna", mode=0o700, exist_ok=True)
@@ -364,6 +372,11 @@ def finish():
         save_settings()
     except Exception as e:
         log(f"save: {type(e).__name__}")
+    try:
+        apply_admin(state["admin"])
+    except Exception as e:
+        log(f"admin: {type(e).__name__}")
+        return {"ok": False, "error": "could not set admin rights"}
     state["handed_off"] = True
     log("hand-off allowed")
     return {"ok": True}
@@ -392,7 +405,7 @@ def launch(app, wayland, url):
     if app not in ("tor-browser", "unsafe-browser"):
         return {"ok": False, "error": "unknown app"}
     if app == "unsafe-browser" and not state["unsafe"]:
-        return {"ok": False, "error": "the Unsafe Browser is off: switch it on in Lacuna Settings or the greeter"}
+        return {"ok": False, "error": "the Unsafe Browser is off: switch it on in Settings or the greeter"}
     r = run([APPBOX, app, str(wayland), str(url or "")], timeout=120)
     return {"ok": r.returncode == 0, "error": (r.stderr.strip().splitlines() or ["appbox failed"])[-1]
             if r.returncode else None}
@@ -467,6 +480,9 @@ def handle(req, session=False):
         return set_password(None if pw is None else str(pw))
     if op == "set_mac":
         return set_mac(bool(req.get("random", True)))
+    if op == "set_admin":
+        state["admin"] = req.get("on") is True
+        return {"ok": True}
     if op == "wifi_scan":
         return wifi_scan()
     if op == "wifi_connect":
@@ -485,7 +501,7 @@ def handle(req, session=False):
         return set_session(str(req.get("session", "")))
     if op == "set_apps":
         return set_apps(req.get("apps"))
-    if op == "leaktest":                                # milestone 4's acceptance check, from Lacuna Settings
+    if op == "leaktest":                                # milestone 4's acceptance check, from Settings
         r = run(["/usr/local/bin/leaktest"] + (["--inject"] if req.get("inject") is True else []), timeout=400)
         return {"ok": True, "passed": r.returncode == 0, "output": (r.stdout + r.stderr)[-6000:]}
     if op == "set_unsafe":
@@ -543,6 +559,10 @@ def main():
     s.listen(4)
     state["password_set"] = password_is_set()
     publish_password_flag()
+    try:
+        apply_admin(False)                       # no sudo until the greeter says so (the image adds nobody to wheel)
+    except Exception as e:
+        log(f"admin: {type(e).__name__}")
     log("ready")
     while True:
         conn, _ = s.accept()

@@ -20,19 +20,19 @@ sed -i -e 's|spawn-sh "qs -c vbar ipc call song key play-pause"|spawn "playerctl
        -e 's|spawn-sh "qs -c vbar ipc call song key previous"|spawn "playerctl" "previous"|' \
        -e 's|spawn-sh "qs -c vbar ipc call song key next"|spawn "playerctl" "next"|' \
        "$dst/.config/niri/config.kdl"
-# locking without a password would be a dead end: idle/lid/keybind locks go through lacuna-lock
-sed -i -e "s|'caelestia shell lock lock'|'lacuna-lock idle'|g" \
-       -e 's|spawn "caelestia" "shell" "lock" "lock"|spawn "lacuna-lock"|g' "$dst/.config/niri/config.kdl"
-# idle with no password set: lacuna-lock only blanks the screens and marks it, so the reaper (6 hours) counts it
+# locking without a password would be a dead end: idle/lid/keybind locks go through lock
+sed -i -e "s|'caelestia shell lock lock'|'/usr/local/bin/lock idle'|g" \
+       -e 's|spawn "caelestia" "shell" "lock" "lock"|spawn "/usr/local/bin/lock"|g' "$dst/.config/niri/config.kdl"
+# idle with no password set: lock only blanks the screens and marks it, so the reaper (6 hours) counts it
 # like a lock; the resume clears the mark
-sed -i "s|timeout 300 'lacuna-lock idle'|timeout 300 'lacuna-lock idle' resume 'lacuna-lock resume'|" "$dst/.config/niri/config.kdl"
-grep -q "resume 'lacuna-lock resume'" "$dst/.config/niri/config.kdl" || { echo "make-skel: the swayidle line changed; update the lacuna-lock edit" >&2; exit 1; }
-# everything else that locks (lid close, the bar) uses ~/.local/bin/lock: through lacuna-lock as well
+sed -i "s|timeout 300 '/usr/local/bin/lock idle'|timeout 300 '/usr/local/bin/lock idle' resume '/usr/local/bin/lock resume'|" "$dst/.config/niri/config.kdl"
+grep -q "resume '/usr/local/bin/lock resume'" "$dst/.config/niri/config.kdl" || { echo "make-skel: the swayidle line changed; update the lock edit" >&2; exit 1; }
+# everything else that locks (lid close, the bar) uses ~/.local/bin/lock: through lock as well
 if [[ -f $dst/.local/bin/lid-close ]]; then
-    sed -i 's|"$HOME/.local/bin/lock"|lacuna-lock idle|g' "$dst/.local/bin/lid-close"
+    sed -i 's|"$HOME/.local/bin/lock"|/usr/local/bin/lock idle|g' "$dst/.local/bin/lid-close"
 fi
 if [[ -f $dst/.local/bin/lock ]]; then
-    printf '#!/bin/sh\n# Lacuna: locking goes through lacuna-lock (it never locks without a password)\nexec lacuna-lock "$@"\n' \
+    printf '#!/bin/sh\n# the system lock command (it knows the session: caelestia or swaylock)\nexec /usr/local/bin/lock "$@"\n' \
         > "$dst/.local/bin/lock"
     chmod 755 "$dst/.local/bin/lock"
 fi

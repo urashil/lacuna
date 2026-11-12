@@ -1,4 +1,4 @@
-// Greeter session: the blurred wallpaper and one see-through foot running lacuna-greeter. Nothing else to launch.
+// Greeter session: the blurred wallpaper and one see-through foot running greeter. Nothing else to launch.
 input {
     keyboard {
         xkb {
@@ -33,7 +33,7 @@ animations {
     off
 }
 window-rule {
-    match app-id="^lacuna-greeter$"
+    match app-id="^greeter$"
     open-maximized true
 }
 spawn-sh-at-startup "awww-daemon >/dev/null 2>&1 & sleep 0.4; awww img --transition-type none /usr/share/lacuna/greeter/wallpaper.png"

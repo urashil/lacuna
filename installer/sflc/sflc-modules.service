@@ -1,0 +1,12 @@
+[Unit]
+Description=Kernel modules for the system's kernel (Shufflecake, shared EFI partition)
+DefaultDependencies=no
+After=sysroot.mount
+Requires=sysroot.mount
+Before=initrd-root-fs.target initrd-parse-etc.service
+ConditionPathExists=/etc/initrd-release
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/sflc/modules

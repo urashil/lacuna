@@ -1,0 +1,13 @@
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/modules/*/updates/dkms/*
+Target = usr/src/dm-sflc-*/dkms.conf
+
+[Action]
+Description = Copying the kernel modules to the EFI partition (Shufflecake: shared by the systems on this disk)
+When = PostTransaction
+Exec = /usr/local/lib/sflc/modules-sfs

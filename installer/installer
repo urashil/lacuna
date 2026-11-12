@@ -8,7 +8,7 @@ Every choice is kept in a JSON configuration, which can be saved (in the persist
 ~/Private/lacuna-installer/) and loaded again for the next install. Passphrases and passwords are never saved.
 The installer is the only thing in Lacuna that writes to an internal disk, and only after you type its name.
 """
-import getpass, json, os, re, shlex, shutil, subprocess, sys, threading, time
+import getpass, glob, json, os, re, secrets as rnd, shlex, shutil, subprocess, sys, threading, time
 
 VERSION = 1
 MNT = "/mnt/lacuna-install"
@@ -27,6 +27,14 @@ HARDEN_MODULES = {
     "keep": ("Keep the previous 2 kernel images as boot entries", []),
 }
 FS_PKG = {"xfs": "xfsprogs", "ext4": "e2fsprogs", "btrfs": "btrfs-progs"}
+SFLC = "/usr/local/sbin/sflc"
+SFLC_SRC = "/usr/share/lacuna/shufflecake/shufflecake-*.tar.gz"      # built on the new system (DKMS)
+SFLC_FILES = "/usr/share/lacuna/installer/sflc"                      # its boot hook, units and scripts
+TPM_FILES = "/usr/share/lacuna/installer/tpm"                        # TPM2 enrollment at the first start
+DECOY_MNT = "/mnt/install-decoy"
+RICE_FILES = "/usr/share/lacuna/installer/rice"                      # the rice's boot (Plymouth) and login (SDDM) screens
+SDDM_PKGS = ["sddm", "qt6-svg", "qt6-virtualkeyboard", "qt6-multimedia-ffmpeg", "qt6-imageformats"]
+FACTORS = ("passphrase", "tpm2", "fido2")
 
 
 class Fail(Exception):
@@ -39,7 +47,8 @@ def empty_config():
             "disk": {"device": None, "serial": None, "model": None, "size": None, "mode": None,
                      "esp_size_mib": None, "esp": None, "root": None, "format_esp": None},
             "luks": {"enabled": None, "cipher": None, "key_size": None, "pbkdf": None, "iter_time_ms": None,
-                     "tpm2": None, "tpm2_pcrs": None, "fido2": None},
+                     "passphrase": None, "tpm2": None, "tpm2_pcrs": None, "fido2": None, "require": None},
+            "shufflecake": {"enabled": None, "hidden": None, "fill": None, "tpm": None},
             "filesystem": None,
             "swap": {"kind": None, "size_gib": None},
             "boot": {"loader": None, "secureboot": None, "microsoft_keys": None, "enroll_now": None},
@@ -63,9 +72,17 @@ def check_config(c):
         p.append("disk: EFI partition size between 300 and 8192 MiB")
     if d.get("mode") == "manual" and not (d.get("esp") and d.get("root")):
         p.append("disk: manual partitioning needs the EFI and the root partition")
-    if l.get("enabled") is None:
-        p.append("encryption: choose whether to encrypt")
+    sf = c.get("shufflecake") or {}
+    if l.get("enabled") is None or sf.get("enabled") is None:
+        p.append("encryption: choose LUKS2, Shufflecake or none")
+    if l.get("enabled") and sf.get("enabled"):
+        p.append("encryption: LUKS2 or Shufflecake, not both")
     if l.get("enabled"):
+        f = factors(l)
+        if not f:
+            p.append("encryption: at least one way to unlock (passphrase, TPM2 or FIDO2)")
+        if len(f) > 1 and l.get("require") not in ("any", "all"):
+            p.append("encryption: with several ways to unlock, choose whether any one or all of them are needed")
         if not l.get("cipher") or not re.fullmatch(r"[a-z0-9-]+", l["cipher"]):
             p.append("encryption: cipher")
         if l.get("key_size") not in (256, 512):
@@ -76,6 +93,20 @@ def check_config(c):
             p.append("encryption: unlock time between 100 and 60000 ms")
         if l.get("tpm2") and not re.fullmatch(r"[0-9]+(\+[0-9]+)*", str(l.get("tpm2_pcrs") or "")):
             p.append("encryption: TPM2 PCRs like 7 or 0+7")
+    if sf.get("enabled"):
+        if sf.get("hidden") is None:
+            p.append("encryption: Shufflecake with a hidden system, or a decoy only")
+        if sf.get("fill") is None:
+            p.append("encryption: fill the partition with random data first, or not")
+        if sf.get("tpm") and not b.get("secureboot"):
+            p.append("encryption: the TPM can only guard the decoy passphrase with Secure Boot on (without it any "
+                     "other system would measure the same and could read it)")
+        if b.get("loader") not in (None, "systemd-boot"):
+            p.append("boot: Shufflecake needs systemd-boot (its unlock is in the boot image)")
+        if "lockdown" in c.get("harden", []):
+            p.append("hardening: kernel lockdown would block the Shufflecake module (it isn't signed by a key the kernel trusts)")
+        if s.get("kind") == "swapfile":
+            p.append("swap: with Shufflecake, none or zram (a swap file would be copied into the decoy)")
     if c.get("filesystem") not in FS_PKG:
         p.append("filesystem: xfs, ext4 or btrfs")
     if s.get("kind") not in ("none", "zram", "swapfile"):
@@ -88,8 +119,10 @@ def check_config(c):
         p.append("boot: Secure Boot yes or no")
     if b.get("secureboot") and b.get("loader") != "systemd-boot":
         p.append("boot: Secure Boot here needs systemd-boot (signed UKIs)")
-    if c.get("login") not in ("greetd", "console"):
-        p.append("login: greetd (tuigreet) or the console")
+    if c.get("login") not in ("greetd", "sddm", "console"):
+        p.append("login: greetd (tuigreet), SDDM or the console")
+    if c.get("login") == "sddm" and not c.get("dotfiles"):
+        p.append("login: SDDM here is the rice's login screen: it needs the desktop configuration")
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", sy.get("hostname") or ""):
         p.append("system: hostname (lowercase letters, digits, -)")
     if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sy.get("user") or "") or sy.get("user") in ("root", "amnesia"):
@@ -111,6 +144,11 @@ def check_config(c):
     return p
 
 
+def factors(l):
+    """The ways to unlock a LUKS disk, in layer order (outermost first). Older configurations: passphrase on."""
+    return [f for f in FACTORS if (l.get(f) is not False if f == "passphrase" else l.get(f))]
+
+
 def load_config(path):
     c = empty_config()
     data = json.load(open(path))
@@ -121,7 +159,25 @@ def load_config(path):
             c[k].update({kk: vv for kk, vv in v.items() if kk in c[k]})
         elif k in c:
             c[k] = v
+    # made before Shufflecake and unlock combinations: LUKS with a passphrase (plus tokens, any one opens it)
+    if "shufflecake" not in data:
+        c["shufflecake"]["enabled"] = False
+    if c["luks"]["enabled"]:
+        if c["luks"]["passphrase"] is None:
+            c["luks"]["passphrase"] = True
+        if c["luks"]["require"] is None and len(factors(c["luks"])) > 1 and "require" not in data.get("luks", {}):
+            c["luks"]["require"] = "any"
     return c
+
+
+def sflc_volumes():
+    try:
+        return [n for n in os.listdir("/dev/mapper") if n.startswith("sflc_")]
+    except OSError:
+        return []
+
+
+OPENED = {"luks": [], "sflc": None}      # what cleanup() has to close if the install stops halfway
 
 
 def config_dir():
@@ -175,7 +231,13 @@ def disks():
 
 def partitions(disk):
     out = json.loads(sh(["lsblk", "-J", "-b", "-o", "PATH,SIZE,FSTYPE,PARTTYPENAME,TYPE", disk]).stdout)
-    return [p for p in out["blockdevices"][0].get("children", []) if p["type"] == "part"]
+    # without the NAME column lsblk lists the partitions next to the disk instead of as its children: take both
+    devs, flat = out.get("blockdevices", []), []
+    while devs:
+        d = devs.pop(0)
+        flat.append(d)
+        devs = d.get("children", []) + devs
+    return [p for p in flat if p.get("type") == "part"]
 
 
 def gib(b):
@@ -210,10 +272,16 @@ class Install:
         if data is not None:
             p.stdin.write(data)
         p.stdin.close()
-        tail = []
+        tail, shown = [], -1
         for line in p.stdout:
             line = line.rstrip()
             tail = (tail + [line])[-5:]
+            # long progress counters (Shufflecake's random fill prints one per MiB): every 5 % is enough
+            m = re.search(r"\((\d+)(?:\.\d+)?%", line)
+            if m or line.startswith(("). Estimated", "Estimated time")):
+                if not m or int(m.group(1)) // 5 == shown:
+                    continue
+                shown = int(m.group(1)) // 5
             self.log("    " + line)
         if p.wait() != 0 and check:
             raise Fail(f"{os.path.basename(cmd[0])} failed: {tail[-1] if tail else p.returncode}")
@@ -240,12 +308,14 @@ class Install:
         self.packages()
         self.configure()
         self.users()
+        self.shufflecake()
         self.boot()
         self.extras()
         self.harden()
         self.images()
         self.secureboot()
         self.unlock_extras()
+        self.decoy()
         self.finish()
 
     def prepare_disk(self):
@@ -259,10 +329,17 @@ class Install:
         if d["mode"] == "guided":
             self.run(["wipefs", "-a", d["device"]])
             self.run(["sfdisk", "--wipe", "always", d["device"]],
-                     data=f"label: gpt\nsize={d['esp_size_mib']}MiB, type=uefi, name=EFI\ntype=linux, name=root\n")
-            self.run(["udevadm", "settle"])
-            parts = partitions(d["device"])
-            if len(parts) < 2:
+                     data=f"label: gpt\nsize={d['esp_size_mib']}MiB, type=uefi, name=EFI\ntype=linux"
+                          + ("\n" if self.c["shufflecake"]["enabled"] else ", name=root\n"))
+            # the kernel and udev take a moment to show the new partitions (lsblk can still see none right after)
+            for _ in range(30):
+                self.run(["udevadm", "settle"])
+                parts = partitions(d["device"])
+                if len(parts) >= 2 and all(os.path.exists(p["path"]) for p in parts[:2]):
+                    break
+                self.run(["partx", "-u", d["device"]], check=False)
+                time.sleep(0.5)
+            else:
                 raise Fail("the new partitions didn't show up")
             self.esp, self.root = parts[0]["path"], parts[1]["path"]
             for p in (self.esp, self.root):
@@ -271,27 +348,67 @@ class Install:
         else:
             self.esp, self.root, self.format_esp = d["esp"], d["root"], bool(d["format_esp"])
 
+    def layers(self):
+        """LUKS: one layer holding every way to unlock (any one opens it), or, when all are needed, one layer per
+        way, nested (the passphrase opens the outer one, the TPM2 the next, ...)."""
+        f = factors(self.c["luks"])
+        return [f] if self.c["luks"].get("require") != "all" or len(f) == 1 else [[x] for x in f]
+
     def encrypt_and_format(self):
         l, fs = self.c["luks"], self.c["filesystem"]
         dev = self.root
+        self.crypt = []
         if l["enabled"]:
-            self.step("encryption (LUKS2)")
-            self.run(["cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2", "--cipher", l["cipher"],
-                      "--key-size", str(l["key_size"]), "--pbkdf", l["pbkdf"], "--iter-time", str(l["iter_time_ms"]),
-                      "--key-file", "-", self.root], data=self.s["luks"])
-            self.run(["cryptsetup", "open", "--key-file", "-", self.root, "root"], data=self.s["luks"])
-            dev = "/dev/mapper/root"
+            layers = self.layers()
+            for i, fac in enumerate(layers):
+                name = "root" if i == len(layers) - 1 else f"crypt{i}"
+                # a layer without the passphrase starts with a random key; the TPM2/FIDO2 and a recovery key are
+                # enrolled with it later (unlock_extras), and then it is wiped
+                key = self.s["luks"] if "passphrase" in fac else rnd.token_hex(32)
+                self.step(f"encryption (LUKS2" + (f", layer {i + 1} of {len(layers)}" if len(layers) > 1 else "")
+                          + f": {' or '.join(fac)})")
+                self.run(["cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2", "--cipher", l["cipher"],
+                          "--key-size", str(l["key_size"]), "--pbkdf", l["pbkdf"], "--iter-time", str(l["iter_time_ms"]),
+                          "--key-file", "-", dev], data=key)
+                self.run(["cryptsetup", "open", "--key-file", "-", dev, name], data=key)
+                OPENED["luks"].append(name)
+                self.crypt.append({"dev": dev, "name": name, "factors": fac, "key": key})
+                dev = f"/dev/mapper/{name}"
+        elif self.c["shufflecake"]["enabled"]:
+            sf = self.c["shufflecake"]
+            pws = [self.s["decoy"]] + ([self.s["hidden"]] if sf["hidden"] else [])
+            self.step("encryption (Shufflecake: " + ("a decoy volume and a hidden one" if sf["hidden"] else "one volume") + ")")
+            if sf["fill"]:
+                self.log("  filling the partition with random data first (what makes the volumes deniable): this takes a while")
+            self.run([SFLC, f"--num-volumes={len(pws)}"] + ([] if sf["fill"] else ["--skip-randfill"]) + ["init", self.root],
+                     data="".join(p + "\n" for p in pws))
+            before = set(sflc_volumes())
+            self.run([SFLC, "open", self.root], data=pws[-1] + "\n")      # the top passphrase opens them all
+            OPENED["sflc"] = self.root
+            vols = sorted(set(sflc_volumes()) - before, key=lambda n: int(n.rsplit("_", 1)[1]))
+            if len(vols) != len(pws):
+                raise Fail("the new Shufflecake volumes didn't open")
+            self.sflc_vols = [f"/dev/mapper/{v}" for v in vols]
+            dev = self.sflc_vols[-1]                  # the system goes into the top volume; the decoy is a copy
         self.dev = dev
         self.step(f"filesystems ({fs})")
         if self.format_esp:
             self.run(["mkfs.fat", "-F", "32", "-n", "EFI", self.esp])
-        self.run({"xfs": ["mkfs.xfs", "-f"], "ext4": ["mkfs.ext4", "-F"], "btrfs": ["mkfs.btrfs", "-f"]}[fs] + [dev])
+        self.mkfs(dev)
+
+    def mkfs(self, dev, mnt=MNT):
+        fs = self.c["filesystem"]
+        # Shufflecake: no discard (it would hand blocks back that the other volume's layout must not reveal)
+        nd = self.c["shufflecake"]["enabled"]
+        self.run({"xfs": ["mkfs.xfs", "-f"] + (["-K"] if nd else []),
+                  "ext4": ["mkfs.ext4", "-F"] + (["-E", "nodiscard"] if nd else []),
+                  "btrfs": ["mkfs.btrfs", "-f"] + (["-K"] if nd else [])}[fs] + [dev])
         if fs == "btrfs":
-            os.makedirs(MNT, exist_ok=True)
-            self.run(["mount", dev, MNT])
+            os.makedirs(mnt, exist_ok=True)
+            self.run(["mount", dev, mnt])
             for sv in ("@", "@home"):
-                self.run(["btrfs", "subvolume", "create", f"{MNT}/{sv}"])
-            self.run(["umount", MNT])
+                self.run(["btrfs", "subvolume", "create", f"{mnt}/{sv}"])
+            self.run(["umount", mnt])
 
     def mount(self):
         self.step("mounting")
@@ -310,6 +427,11 @@ class Install:
         pk = ["base", "linux-hardened", "linux-hardened-headers", "linux-firmware", "sof-firmware", "intel-ucode",
               "amd-ucode", "mkinitcpio", "systemd-ukify", "sudo", "nano", "less", "man-db", "networkmanager",
               "wireless-regdb", "dosfstools", FS_PKG[c["filesystem"]]]
+        if c["shufflecake"]["enabled"]:
+            # its kernel module is built for every new kernel (DKMS); squashfs-tools: the modules copy (sflc/modules)
+            pk += ["dkms", "base-devel", "libgcrypt", "device-mapper", "squashfs-tools"]
+            if c["shufflecake"].get("tpm"):
+                pk.append("tpm2-tss")
         if c["luks"]["enabled"]:
             pk.append("cryptsetup")
             if c["luks"]["tpm2"]:
@@ -322,6 +444,10 @@ class Install:
             pk.append("sbctl")
         if c["login"] == "greetd":
             pk += ["greetd", "greetd-tuigreet"]
+        if c["login"] == "sddm":
+            pk += SDDM_PKGS
+        if c["dotfiles"]:
+            pk += ["plymouth", "ffmpeg", "librsvg"]           # the rice's boot screen (rice-boot)
         pk.append(c["system"]["shell"].rsplit("/", 1)[1])
         for name in c["packages"]["groups"]:
             pk += g.get(name, {}).get("packages", [])
@@ -345,6 +471,11 @@ class Install:
             f.write(base.replace("[core]", f"[lacuna]\nSigLevel = Optional TrustAll\nServer = file://{REPO}\n\n[core]", 1))
         self.run(["pacstrap", "-C", conf, "-K", MNT] + self.package_list())
         self.run(["sh", "-c", f"genfstab -U {MNT} >> {MNT}/etc/fstab"])
+        if self.c["shufflecake"]["enabled"]:
+            # the root is whichever volume the passphrase opened, always mapped as /dev/mapper/root
+            u = self.uuid(self.dev)
+            fstab = open(f"{MNT}/etc/fstab").read().replace(f"UUID={u}", "/dev/mapper/root")
+            open(f"{MNT}/etc/fstab", "w").write(fstab)
 
     def configure(self):
         sy = self.c["system"]
@@ -387,7 +518,7 @@ class Install:
         self.chroot("useradd", "-m", "-G", "wheel", "-s", sy["shell"], sy["user"])
         self.chroot("chpasswd", data=f"{sy['user']}:{self.s['user']}\n")
         os.makedirs(f"{MNT}/etc/sudoers.d", exist_ok=True)
-        open(f"{MNT}/etc/sudoers.d/10-wheel", "w").write("%wheel ALL=(ALL:ALL) ALL\n")
+        open(f"{MNT}/etc/sudoers.d/10-wheel", "w").write("Defaults lecture=never\n%wheel ALL=(ALL:ALL) ALL\n")
         os.chmod(f"{MNT}/etc/sudoers.d/10-wheel", 0o440)
         if self.s.get("root"):
             self.chroot("chpasswd", data=f"root:{self.s['root']}\n")
@@ -406,25 +537,33 @@ class Install:
     def boot(self):
         c, l = self.c, self.c["luks"]
         self.step("boot images (UKI)")
-        hooks = ["base", "systemd", "autodetect", "microcode", "modconf", "kms", "keyboard", "sd-vconsole", "block"]
+        hooks = ["base", "systemd"] + (["plymouth"] if c["dotfiles"] else []) + \
+                ["autodetect", "microcode", "modconf", "kms", "keyboard", "sd-vconsole", "block"]
         if l["enabled"]:
             hooks.append("sd-encrypt")
+        if self.c["shufflecake"]["enabled"]:
+            hooks.append("sflc")
         hooks += ["filesystems", "fsck"]
         os.makedirs(f"{MNT}/etc/mkinitcpio.conf.d", exist_ok=True)
         open(f"{MNT}/etc/mkinitcpio.conf.d/installer.conf", "w").write(f"HOOKS=({' '.join(hooks)})\n")
         if l["enabled"]:
-            opts = []
-            if l["tpm2"]:
-                opts.append("tpm2-device=auto")
-            if l["fido2"]:
-                opts.append("fido2-device=auto")
-            cmd = f"rd.luks.name={self.uuid(self.root)}=root root=/dev/mapper/root"
-            if opts:
-                cmd += f" rd.luks.options={','.join(opts)}"
+            parts = []
+            for L in self.crypt:                       # nested layers open outermost first
+                u = self.uuid(L["dev"])
+                parts.append(f"rd.luks.name={u}={L['name']}")
+                opts = [o for f, o in (("tpm2", "tpm2-device=auto"), ("fido2", "fido2-device=auto")) if f in L["factors"]]
+                if opts:
+                    parts.append(f"rd.luks.options={u}={','.join(opts)}")
+            cmd = " ".join(parts) + " root=/dev/mapper/root"
+        elif self.c["shufflecake"]["enabled"]:
+            # the root device only appears after the passphrase: wait for it as long as it takes
+            cmd = "root=/dev/mapper/root systemd.default_device_timeout_sec=infinity"
         else:
             cmd = f"root=UUID={self.uuid(self.dev)}"
         if c["filesystem"] == "btrfs":
             cmd += " rootflags=subvol=@"
+        if c["dotfiles"]:
+            cmd += " quiet splash loglevel=3 vt.global_cursor_default=0"     # the rice's boot screen
         os.makedirs(f"{MNT}/etc/kernel", exist_ok=True)
         open(f"{MNT}/etc/kernel/cmdline", "w").write(cmd + " rw\n")
         open(f"{MNT}/etc/mkinitcpio.d/linux-hardened.preset", "w").write(
@@ -444,11 +583,36 @@ class Install:
         self.run(["sh", "-c", f"grep -rlI /home/amnesia {shlex.quote(MNT + home)} | xargs -r sed -i "
                               f"'s|/home/amnesia|{home}|g'"])
         self.chroot("chown", "-R", f"{sy['user']}:{sy['user']}", home)
-        # the dotfiles lock through lacuna-lock; here there is always a password, so it just locks
-        open(f"{MNT}/usr/local/bin/lacuna-lock", "w").write(
+        # what the live image generates at build time (scripts/customize.sh): niri includes colors.kdl and
+        # keyboard.kdl and won't load its config without them (it falls back to its default desktop), and caelestia
+        # needs a scheme with a light mode
+        gen = ('wp=$(cat ~/.cache/rice/current 2>/dev/null); '
+               '[ -n "$wp" ] && caelestia wallpaper -f "$wp" >/dev/null 2>&1; '
+               'caelestia scheme set -n dynamic -m dark >/dev/null 2>&1; '
+               'if [ -x ~/.local/bin/rice-theme-sync ]; then ~/.local/bin/rice-theme-sync >/dev/null 2>&1; '
+               'elif [ -n "$wp" ]; then matugen image "$wp" --mode dark --type scheme-tonal-spot --prefer saturation --quiet; fi; '
+               '[ -x ~/.local/bin/keyboard-mode ] && ~/.local/bin/keyboard-mode standard >/dev/null; '
+               'rm -f ~/.config/rice/keyboard-mode; true')
+        env = ["env", f"HOME={home}", f"XDG_CONFIG_HOME={home}/.config", f"XDG_CACHE_HOME={home}/.cache",
+               f"XDG_STATE_HOME={home}/.local/state", f"USER={sy['user']}"]
+        self.chroot("runuser", "-u", sy["user"], "--", *env, "sh", "-c", gen, check=False)
+        # the boot screen (Plymouth) and, with SDDM, the login screen, as the dotfiles set them up
+        # (through /var/tmp: arch-chroot mounts an empty tmpfs over the new system's /tmp)
+        shutil.rmtree(f"{MNT}/var/tmp/rice-boot", ignore_errors=True)
+        shutil.copytree(RICE_FILES, f"{MNT}/var/tmp/rice-boot", symlinks=True)
+        if self.chroot("bash", "/var/tmp/rice-boot/rice-boot", sy["user"], *(["sddm"] if c["login"] == "sddm" else []),
+                       check=False) != 0:
+            self.log("  WARNING: the rice's boot/login screens weren't set up (the system boots with the plain ones)")
+        shutil.rmtree(f"{MNT}/var/tmp/rice-boot", ignore_errors=True)
+        if os.path.exists(f"{MNT}{home}/.config/niri/config.kdl") and self.chroot(
+                "runuser", "-u", sy["user"], "--", *env, "niri", "validate", "-c", f"{home}/.config/niri/config.kdl",
+                check=False) != 0:
+            self.log("  WARNING: niri doesn't accept the desktop configuration; it will start with its default one")
+        # the dotfiles lock through lock; here there is always a password, so it just locks
+        open(f"{MNT}/usr/local/bin/lock", "w").write(
             '#!/bin/sh\n# installed system: lock with caelestia\'s lock screen (the live system\'s no-password '
             'rule does not apply)\n[ "${1:-}" = resume ] && exit 0\nexec caelestia shell lock lock\n')
-        os.chmod(f"{MNT}/usr/local/bin/lacuna-lock", 0o755)
+        os.chmod(f"{MNT}/usr/local/bin/lock", 0o755)
 
     def harden(self):
         mods = self.c["harden"]
@@ -495,25 +659,122 @@ class Install:
 
     def unlock_extras(self):
         l = self.c["luks"]
-        if not l["enabled"] or not (l["tpm2"] or l["fido2"]):
+        if not l["enabled"]:
             return
-        env = {**os.environ, "PASSWORD": self.s["luks"]}       # systemd-cryptenroll reads the passphrase from here
-        if l["tpm2"]:
-            self.step(f"TPM2 unlock (PCRs {l['tpm2_pcrs']})")
-            self.run(["systemd-cryptenroll", "--tpm2-device=auto", f"--tpm2-pcrs={l['tpm2_pcrs']}", self.root], env=env)
-            if "7" in l["tpm2_pcrs"].split("+") and self.c["boot"]["secureboot"]:
-                self.log("  PCR 7 changes when Secure Boot is turned on: afterwards re-enroll with\n"
-                         f"  sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs={l['tpm2_pcrs']} {self.root}")
-        if l["fido2"]:
-            self.step("FIDO2 unlock (touch the key when it blinks)")
-            self.run(["systemd-cryptenroll", "--fido2-device=auto", self.root], env=env)
+        later = []
+        for L in self.crypt:
+            dev, fac = L["dev"], L["factors"]
+            env = {**os.environ, "PASSWORD": L["key"]}      # systemd-cryptenroll reads the layer's key from here
+            if "fido2" in fac:
+                self.step("FIDO2 unlock (touch the key when it blinks)")
+                self.run(["systemd-cryptenroll", "--fido2-device=auto", dev], env=env)
+            if "passphrase" not in fac:
+                # no passphrase on this layer: a recovery key stands in when the TPM2 or the key fails
+                self.step("RECOVERY KEY: write it down now (it replaces " + " or ".join(fac) + " if that ever fails)")
+                self.run(["systemd-cryptenroll", "--recovery-key", dev], env=env)
+            if "tpm2" in fac:
+                # the TPM2 measures the boot chain, and this one (the stick's) isn't the new system's: it's enrolled at
+                # the first start (tpm-enroll), with a temporary key kept inside the encrypted system until then
+                u = self.uuid(dev)
+                tmp = f"/run/lacuna/tpm-{u}.key"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.write(fd, rnd.token_hex(32).encode()); os.close(fd)
+                self.run(["cryptsetup", "luksAddKey", "--batch-mode", "--key-file", "-", dev, tmp], data=L["key"])
+                os.makedirs(f"{MNT}/etc/tpm-enroll", mode=0o700, exist_ok=True)
+                shutil.move(tmp, f"{MNT}/etc/tpm-enroll/{u}.key")
+                os.chmod(f"{MNT}/etc/tpm-enroll/{u}.key", 0o400)
+                later.append(f"{u} {l['tpm2_pcrs']}")
+            if "passphrase" not in fac:
+                self.run(["cryptsetup", "luksRemoveKey", "--batch-mode", "--key-file", "-", dev], data=L["key"])  # the random start key
+                L["key"] = None
+        if later:
+            open(f"{MNT}/etc/tpm-enroll/list", "w").write("\n".join(later) + "\n")
+            shutil.copy(f"{TPM_FILES}/tpm-enroll", f"{MNT}/usr/local/lib/tpm-enroll")
+            os.chmod(f"{MNT}/usr/local/lib/tpm-enroll", 0o755)
+            shutil.copy(f"{TPM_FILES}/tpm-enroll.service", f"{MNT}/etc/systemd/system/tpm-enroll.service")
+            self.chroot("systemctl", "enable", "tpm-enroll.service")
+            self.log("  FIRST START: the TPM2 isn't set up until then. Type the "
+                     + ("passphrase" if l.get("passphrase") is not False and l.get("require") != "all" else "recovery key")
+                     + " for it once; the system then binds the TPM2 to its own boot chain by itself."
+                     + (" Turning Secure Boot on later changes PCR 7: type it once more and run "
+                        "'sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=" + l["tpm2_pcrs"] + " DEVICE'."
+                        if "7" in l["tpm2_pcrs"].split("+") and not (self.c["boot"]["secureboot"] and self.c["boot"]["enroll_now"])
+                        else ""))
+
+    def shufflecake(self):
+        """The Shufflecake pieces on the new system: the module (DKMS) and CLI, the boot unlock, the modules copy."""
+        if not self.c["shufflecake"]["enabled"]:
+            return
+        self.step("Shufflecake on the new system (module, unlock at boot)")
+        src = sorted(glob.glob(SFLC_SRC))
+        if not src:
+            raise Fail("the Shufflecake source isn't on this stick")
+        shutil.copy(src[-1], f"{MNT}/var/tmp/shufflecake.tar.gz")
+        self.chroot("sh", "-c", "rm -rf /var/tmp/sflc && mkdir -p /var/tmp/sflc && "
+                                "tar -xzf /var/tmp/shufflecake.tar.gz -C /var/tmp/sflc --strip-components=1 && "
+                                "make -C /var/tmp/sflc install DESTDIR=/ PREFIX=/usr/local >/var/tmp/sflc-build.log 2>&1 || "
+                                "{ tail -20 /var/tmp/sflc-build.log; exit 1; }")
+        ver = sorted(glob.glob(f"{MNT}/usr/src/dm-sflc-*"))[-1].rsplit("dm-sflc-", 1)[1]
+        for k in sorted(os.listdir(f"{MNT}/usr/lib/modules")):
+            if os.path.exists(f"{MNT}/usr/lib/modules/{k}/vmlinuz"):
+                self.chroot("dkms", "install", f"dm-sflc/{ver}", "-k", k)
+        self.chroot("rm", "-rf", "/var/tmp/sflc", "/var/tmp/shufflecake.tar.gz", "/var/tmp/sflc-build.log")
+        os.makedirs(f"{MNT}/usr/local/lib/sflc", exist_ok=True)
+        for f, dst, mode in (("unlock", "/usr/local/lib/sflc/unlock", 0o755), ("modules", "/usr/local/lib/sflc/modules", 0o755),
+                             ("modules-sfs", "/usr/local/lib/sflc/modules-sfs", 0o755),
+                             ("sflc-unlock.service", "/usr/local/lib/sflc/sflc-unlock.service", 0o644),
+                             ("sflc-modules.service", "/usr/local/lib/sflc/sflc-modules.service", 0o644),
+                             ("initcpio-install", "/etc/initcpio/install/sflc", 0o644),
+                             ("95-sflc-modules.hook", "/etc/pacman.d/hooks/95-sflc-modules.hook", 0o644),
+                             ("decoy-mount", "/usr/local/lib/sflc/decoy-mount", 0o755),
+                             ("sflc-decoy.service", "/etc/systemd/system/sflc-decoy.service", 0o644),
+                             ("sflc-tpm", "/usr/local/bin/sflc-tpm", 0o755)):
+            os.makedirs(os.path.dirname(MNT + dst), exist_ok=True)
+            shutil.copy(f"{SFLC_FILES}/{f}", MNT + dst)
+            os.chmod(MNT + dst, mode)
+        open(f"{MNT}/etc/sflc-root.conf", "w").write(
+            f"DEV=/dev/disk/by-partuuid/{self.partuuid(self.root)}\nESP=/dev/disk/by-partuuid/{self.partuuid(self.esp)}\n"
+            + ("TPM=1\nTIMEOUT=10\n" if self.c["shufflecake"].get("tpm") else ""))
+        self.chroot("systemctl", "enable", "sflc-decoy.service")
+        self.chroot("/usr/local/lib/sflc/modules-sfs")
+
+    def partuuid(self, dev):
+        return sh(["blkid", "-s", "PARTUUID", "-o", "value", dev]).stdout.strip()
+
+    def decoy(self):
+        """Hidden + decoy: the decoy volume gets a copy of the finished system (its own machine id), so either
+        passphrase starts a complete, working system."""
+        sf = self.c["shufflecake"]
+        if not (sf["enabled"] and sf["hidden"]):
+            return
+        self.step("the decoy system (a copy of this one)")
+        dev = self.sflc_vols[0]
+        self.mkfs(dev, DECOY_MNT)
+        os.makedirs(DECOY_MNT, exist_ok=True)
+        btr = self.c["filesystem"] == "btrfs"
+        self.run(["mount"] + (["-o", "subvol=@"] if btr else []) + [dev, DECOY_MNT])
+        mounts = [("", "")]
+        if btr:
+            os.makedirs(DECOY_MNT + "/home", exist_ok=True)
+            self.run(["mount", "-o", "subvol=@home", dev, DECOY_MNT + "/home"])
+            mounts.append(("/home", "/home"))
+        for a, b in mounts:                    # -x: not /boot (the shared EFI partition), not the other mounts
+            self.run(["cp", "-ax", f"{MNT}{a}/.", f"{DECOY_MNT}{b}/"])
+        open(f"{DECOY_MNT}/etc/machine-id", "w").close()       # a new one at its first start
+        self.run(["umount", "-R", DECOY_MNT])
 
     def finish(self):
         self.step("done: unmounting")
         self.run(["sync"])
-        self.run(["umount", "-R", MNT], check=False)
-        if self.c["luks"]["enabled"]:
-            self.run(["cryptsetup", "close", "root"], check=False)
+        release_target()
+        if self.run(["umount", "-R", MNT], check=False) != 0:
+            raise Fail(f"{MNT} is still in use; it's installed, but run `umount -R {MNT}` and close the disk before rebooting")
+        for name in reversed(OPENED["luks"]):
+            self.run(["cryptsetup", "close", name], check=False)
+        OPENED["luks"] = []
+        if OPENED["sflc"]:
+            self.run([SFLC, "close", OPENED["sflc"]], check=False)     # writes out its position maps
+            OPENED["sflc"] = None
         try:
             os.remove("/run/lacuna/installing")
         except FileNotFoundError:
@@ -521,13 +782,46 @@ class Install:
         self.log("\nInstalled. Shut down, remove the stick, and start the machine.")
 
 
+def release_target():
+    """Processes the install left running inside the new system: pacman-key's (and sbctl's) gpg-agent, mostly."""
+    subprocess.run(["gpgconf", "--homedir", f"{MNT}/etc/pacman.d/gnupg", "--kill", "all"], capture_output=True)
+    for _ in range(10):
+        if subprocess.run(["fuser", "-s", "-m", MNT], capture_output=True).returncode != 0:
+            return                                       # nothing uses it any more
+        subprocess.run(["fuser", "-s", "-k", "-TERM", "-m", MNT], capture_output=True)
+        time.sleep(0.5)
+
+
 def cleanup():
+    release_target()
+    subprocess.run(["umount", "-R", DECOY_MNT], capture_output=True)
     subprocess.run(["umount", "-R", MNT], capture_output=True)
-    subprocess.run(["cryptsetup", "close", "root"], capture_output=True)
+    for name in reversed(OPENED["luks"]):
+        subprocess.run(["cryptsetup", "close", name], capture_output=True)
+    OPENED["luks"] = []
+    if OPENED["sflc"]:
+        subprocess.run([SFLC, "close", OPENED["sflc"]], capture_output=True)
+        OPENED["sflc"] = None
     try:
         os.remove("/run/lacuna/installing")
     except FileNotFoundError:
         pass
+
+
+def enc_summary(c):
+    l, sf = c["luks"], c.get("shufflecake") or {}
+    if l["enabled"]:
+        f = [{"passphrase": "passphrase", "tpm2": f"TPM2 (PCRs {l['tpm2_pcrs']})", "fido2": "FIDO2"}[x] for x in factors(l)]
+        how = (" + ".join(f) + ": all needed (one layer each)" if l.get("require") == "all" and len(f) > 1
+               else " or ".join(f) + (": any one opens it" if len(f) > 1 else ""))
+        return (f"LUKS2 {l['cipher']} {l['key_size']} bit, {l['pbkdf']} {l['iter_time_ms']} ms; unlock: {how}"
+                + ("; a recovery key is printed" if "passphrase" not in factors(l) or l.get("require") == "all" and len(f) > 1
+                   else ""))
+    if sf.get("enabled"):
+        return ("Shufflecake, " + ("hidden system + decoy system" if sf.get("hidden") else "one system (decoy only)")
+                + (", random fill first" if sf.get("fill") else ", no random fill")
+                + ("; the TPM opens the decoy after 10 s without input" if sf.get("tpm") else ""))
+    return "none"
 
 
 def summary(c):
@@ -535,9 +829,7 @@ def summary(c):
     lines = [f"Disk:        {d['device']} {d.get('model') or ''} ({gib(d['size']) if d.get('size') else '?'}), "
              + (f"guided: EFI {d['esp_size_mib']} MiB + the rest for the system" if d["mode"] == "guided"
                 else f"manual: EFI {d['esp']} ({'formatted' if d['format_esp'] else 'kept'}), system {d['root']}"),
-             "Encryption:  " + (f"LUKS2 {l['cipher']} {l['key_size']} bit, {l['pbkdf']} {l['iter_time_ms']} ms"
-                                + (f", TPM2 (PCRs {l['tpm2_pcrs']})" if l["tpm2"] else "") + (", FIDO2" if l["fido2"] else "")
-                                if l["enabled"] else "none"),
+             "Encryption:  " + enc_summary(c),
              f"Filesystem:  {c['filesystem']}    Swap: {c['swap']['kind']}"
              + (f" {c['swap']['size_gib']} GiB" if c["swap"]["kind"] == "swapfile" else ""),
              f"Boot:        {b['loader']}" + (", Secure Boot (own keys" + (" + Microsoft" if b["microsoft_keys"] else "")
@@ -579,8 +871,17 @@ def headless(path):
             if a and getpass.getpass("  again: ") == a:
                 return a
             print("  empty or they don't match")
-    if c["luks"]["enabled"]:
+    if c["luks"]["enabled"] and "passphrase" in factors(c["luks"]):
         secrets["luks"] = twice("Disk passphrase")
+    if c["shufflecake"]["enabled"]:
+        secrets["decoy"] = twice("DECOY passphrase (the one you can give up)" if c["shufflecake"]["hidden"]
+                                 else "Disk passphrase")
+        if c["shufflecake"]["hidden"]:
+            while True:
+                secrets["hidden"] = twice("HIDDEN passphrase (the system you really use)")
+                if secrets["hidden"] != secrets["decoy"]:
+                    break
+                print("  it must differ from the decoy passphrase")
     secrets["user"] = twice(f"Password for {c['system']['user']}")
     secrets["root"] = twice("Root password (empty: root stays locked)", allow_empty=True)
     name = os.path.basename(d["device"])
@@ -799,14 +1100,32 @@ def tui():
         TITLE = "Encryption"
 
         def compose(self) -> ComposeResult:
-            l = self.c["luks"]
+            l, sf = self.c["luks"], self.c["shufflecake"]
+            cur = None if l.get("enabled") is None or sf.get("enabled") is None else \
+                ("luks" if l["enabled"] else "sflc" if sf["enabled"] else "no")
             with Center(classes="card"):
                 with Vertical():
                     yield from self.head()
                     with VerticalScroll(classes="body"):
-                        yield from self.radios("enabled", [("yes", "LUKS2: the system partition is encrypted"),
-                                                           ("no", "No encryption")],
-                                               None if l.get("enabled") is None else ("yes" if l["enabled"] else "no"))
+                        yield from self.radios("enabled", [("luks", "LUKS2: the system partition is encrypted"),
+                                                           ("sflc", "Shufflecake: deniable, like the stick's persistence"),
+                                                           ("no", "No encryption")], cur)
+                        with Vertical(id="sflcopts"):
+                            yield Label("The partition looks like random data. One passphrase at boot: the decoy one "
+                                        "starts the decoy system, the hidden one starts the hidden system (and keeps the "
+                                        "decoy safe while it runs). Nothing on the disk shows how many there are.",
+                                        classes="hint")
+                            yield from self.radios("sflckind", [("hidden", "A hidden system and a decoy system (a copy of it)"),
+                                                                ("decoy", "One system only (a decoy: no hidden one, which is the point)")],
+                                                   None if sf.get("hidden") is None else ("hidden" if sf["hidden"] else "decoy"))
+                            yield from self.switch("fill", "Fill the partition with random data first (slow; needed for "
+                                                           "deniability on a disk that held data before)", sf.get("fill", True))
+                            yield from self.switch("sflctpm", "The TPM opens the decoy by itself: the prompt waits 10 s, "
+                                                              "then the decoy starts (needs Secure Boot)", sf.get("tpm"))
+                            yield Label("Booting the decoy system can overwrite the hidden one's data (it can't see it). "
+                                        "With the TPM option the decoy is what starts when nobody types: boot the hidden "
+                                        "system whenever you use the machine, and keep backups of what's in it.",
+                                        classes="warn")
                         with Vertical(id="opts"):
                             yield from self.field("cipher", "Cipher", l.get("cipher"), "aes-xts-plain64")
                             yield from self.radios("key_size", [("512", "512-bit key (AES-256 in XTS)"), ("256", "256-bit key")],
@@ -814,10 +1133,17 @@ def tui():
                             yield from self.radios("pbkdf", [("argon2id", "argon2id"), ("argon2i", "argon2i"),
                                                              ("pbkdf2", "pbkdf2 (only for very old loaders)")], l.get("pbkdf"))
                             yield from self.field("iter", "Time to unlock (ms): longer is harder to guess", l.get("iter_time_ms"), "e.g. 3000")
-                            yield from self.switch("tpm2", "Also unlock with this machine's TPM2 (no passphrase when nothing changed)", l.get("tpm2"))
+                            yield Label("Unlock with", classes="sub")
+                            yield from self.switch("pass", "A passphrase", l.get("passphrase") is not False)
+                            yield from self.switch("tpm2", "This machine's TPM2", l.get("tpm2"))
                             yield from self.field("pcrs", "TPM2 PCRs", l.get("tpm2_pcrs"), "e.g. 7 (Secure Boot state) or 0+7")
-                            yield from self.switch("fido2", "Also unlock with a FIDO2 key (plug it in now)", l.get("fido2"))
-                            yield Label("The passphrase is asked for at the end; it is never saved.", classes="hint")
+                            yield from self.switch("fido2", "A FIDO2 key (plug it in now)", l.get("fido2"))
+                            yield Label("With more than one", classes="sub")
+                            yield from self.radios("require", [("any", "Any one of them opens the disk"),
+                                                               ("all", "All of them are needed (one encryption layer each)")],
+                                                   l.get("require"))
+                            yield Label("Without a passphrase in a layer, the install prints a recovery key for it: write "
+                                        "it down. The passphrase is asked for at the end; it is never saved.", classes="hint")
                     yield from self.buttons()
             yield Footer()
 
@@ -827,17 +1153,27 @@ def tui():
 
         @on(RadioSet.Changed, "#enabled")
         def refresh_opts(self, *_):
-            self.query_one("#opts").display = self.pressed("enabled") == "yes"
+            self.query_one("#opts").display = self.pressed("enabled") == "luks"
+            self.query_one("#sflcopts").display = self.pressed("enabled") == "sflc"
+            self.call_after_refresh(self.fit_body)
 
         def go(self):
-            l = self.c["luks"]
+            l, sf = self.c["luks"], self.c["shufflecake"]
             e = self.pressed("enabled")
-            l["enabled"] = None if e is None else e == "yes"
+            l["enabled"] = None if e is None else e == "luks"
+            sf["enabled"] = None if e is None else e == "sflc"
             if l["enabled"]:
                 ks = self.pressed("key_size")
                 l.update(cipher=self.text("cipher") or None, key_size=int(ks) if ks else None, pbkdf=self.pressed("pbkdf"),
-                         iter_time_ms=self.num("iter"), tpm2=self.query_one("#tpm2", Switch).value,
-                         tpm2_pcrs=self.text("pcrs") or None, fido2=self.query_one("#fido2", Switch).value)
+                         iter_time_ms=self.num("iter"), passphrase=self.query_one("#pass", Switch).value,
+                         tpm2=self.query_one("#tpm2", Switch).value, tpm2_pcrs=self.text("pcrs") or None,
+                         fido2=self.query_one("#fido2", Switch).value, require=self.pressed("require"))
+                if len(factors(l)) < 2:
+                    l["require"] = None
+            if sf["enabled"]:
+                k = self.pressed("sflckind")
+                sf.update(hidden=None if k is None else k == "hidden", fill=self.query_one("#fill", Switch).value,
+                          tpm=self.query_one("#sflctpm", Switch).value)
             probs = [p for p in check_config(self.c) if p.startswith("encryption")]
             if probs:
                 self.say(probs[0], error=True); return
@@ -892,7 +1228,8 @@ def tui():
                             "" if setup_mode() else " (needs setup mode: not now, after the first boot instead)"),
                             b.get("enroll_now") and setup_mode())
                         yield Label("Login", classes="sub")
-                        yield from self.radios("login", [("greetd", "A login screen (greetd + tuigreet)"),
+                        yield from self.radios("login", [("sddm", "SDDM with the rice's theme (needs the desktop configuration)"),
+                                                         ("greetd", "A text login screen (greetd + tuigreet)"),
                                                          ("console", "The text console (start niri-session yourself)")],
                                                self.c.get("login"))
                     yield from self.buttons()
@@ -1015,9 +1352,16 @@ def tui():
                         yield Button("Save", id="save")
                         if not persistent:
                             yield Label("Not in the persistence: it's gone at shutdown unless you save it elsewhere.", classes="warn")
-                        if self.c["luks"]["enabled"]:
+                        if self.c["luks"]["enabled"] and "passphrase" in factors(self.c["luks"]):
                             yield from self.field("luks1", "Disk passphrase", "", password=True)
                             yield from self.field("luks2", "Disk passphrase again", "", password=True)
+                        if self.c["shufflecake"]["enabled"]:
+                            hid = self.c["shufflecake"]["hidden"]
+                            yield from self.field("dec1", "DECOY passphrase (the one you can give up)" if hid else "Disk passphrase", "", password=True)
+                            yield from self.field("dec2", "Again", "", password=True)
+                            if hid:
+                                yield from self.field("hid1", "HIDDEN passphrase (the system you really use)", "", password=True)
+                                yield from self.field("hid2", "Again", "", password=True)
                         yield from self.field("pw1", f"Password for {self.c['system']['user']}", "", password=True)
                         yield from self.field("pw2", "Again", "", password=True)
                         yield from self.field("root", "Root password (empty: root stays locked)", "", password=True)
@@ -1044,11 +1388,23 @@ def tui():
             if probs:
                 self.say(probs[0], error=True); return
             secrets = {}
-            if self.c["luks"]["enabled"]:
+            if self.c["luks"]["enabled"] and "passphrase" in factors(self.c["luks"]):
                 a, b = self.text("luks1"), self.text("luks2")
                 if not a or a != b:
                     self.say("Type the same disk passphrase twice.", error=True); return
                 secrets["luks"] = a
+            if self.c["shufflecake"]["enabled"]:
+                a, b = self.text("dec1"), self.text("dec2")
+                if not a or a != b:
+                    self.say("Type the same decoy passphrase twice.", error=True); return
+                secrets["decoy"] = a
+                if self.c["shufflecake"]["hidden"]:
+                    a, b = self.text("hid1"), self.text("hid2")
+                    if not a or a != b:
+                        self.say("Type the same hidden passphrase twice.", error=True); return
+                    if a == secrets["decoy"]:
+                        self.say("The hidden passphrase must differ from the decoy one.", error=True); return
+                    secrets["hidden"] = a
             a, b = self.text("pw1"), self.text("pw2")
             if not a or a != b:
                 self.say("Type the same user password twice.", error=True); return
@@ -1056,7 +1412,7 @@ def tui():
             secrets["root"] = self.text("root") or None
             if self.text("confirm") != os.path.basename(self.c["disk"]["device"]):
                 self.say("Type the disk's name to confirm.", error=True); return
-            for f in ("luks1", "luks2", "pw1", "pw2", "root"):
+            for f in ("luks1", "luks2", "dec1", "dec2", "hid1", "hid2", "pw1", "pw2", "root"):
                 try:
                     self.query_one("#" + f, Input).value = ""
                 except Exception:

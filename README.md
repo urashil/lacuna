@@ -9,6 +9,8 @@ except through Tor (or a VPN, if you choose), with deniable encrypted persistenc
 
 ## What it does
 
+- **A password every session.** It unlocks the lock screen. Admin rights (sudo) are a separate choice, off by
+  default: without them nothing in the session can become root.
 - **Amnesic.** Runs from RAM. No swap, no hibernation, internal disks read-only. Pulling the stick blacks the
   screen, overwrites free RAM and powers off. A lock timer (6 hours locked or idle) does the same.
 - **Network gate.** A default-drop nftables firewall. After the greeter, traffic leaves only through:
@@ -28,14 +30,18 @@ except through Tor (or a VPN, if you choose), with deniable encrypted persistenc
   - **Hidden + decoy, or decoy only.** Because decoy-only vaults exist, a decoy alone doesn't suggest a hidden
     part.
   - **One prompt.** A wrong passphrase looks exactly like "no persistence here".
-  - **What it keeps:** the hidden part holds your settings (Wi-Fi, VPN accounts, admin password hash, network
+  - **What it keeps:** the hidden part holds your settings (Wi-Fi, VPN accounts, password hash, admin rights, network
     mode) and the folders you choose.
 - **Tor Browser** runs as its own user, confined by AppArmor (the profiles Tails uses). An optional **Unsafe
   Browser** handles Wi-Fi sign-in pages; it's off by default and never available in the opsec session.
 - **Secure Boot** on the stick itself: Microsoft-signed shim, then systemd-boot and the kernel signed with your
   build's own key (enrolled once through MokManager).
 - **Installer.** A TUI where every choice is a prompt and nothing is opinionated:
-  - LUKS2 with optional TPM2/FIDO2, a choice of filesystem and swap;
+  - LUKS2, unlocked by any combination of passphrase, TPM2 and FIDO2: any one of them, or all of them (one
+    encryption layer each), with a recovery key for every layer that has no passphrase;
+  - or Shufflecake, deniable like the stick: a hidden system plus a decoy system, or a decoy only, behind one
+    passphrase prompt;
+  - a choice of filesystem and swap;
   - systemd-boot with signed UKIs, Secure Boot with your own keys;
   - `harden` modules (firewall, sysctl, USBGuard, DNS over HTTPS, AppArmor, lockdown).
 
@@ -72,7 +78,7 @@ itself then.
 |---|---|
 | `build.sh`, `scripts/` | the build: `common.sh` (paths, proot wrappers), one script per stage part |
 | `profile/` | the archiso profile: boot entries, packages, the files laid over the live root |
-| `greeter/` | greetd greeter (Textual TUI), `greeterd` (root daemon), Lacuna Settings, `appbox`, the opsec session |
+| `greeter/` | greetd greeter (Textual TUI), `greeterd` (root daemon), Settings, `appbox`, the opsec session |
 | `gate/` | the network gate (`gate`), `leaktest` |
 | `vault/` | `vault` (deniable persistence), `flash` (stick writer) |
 | `installer/` | `installer`, `harden` |

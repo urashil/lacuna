@@ -24,4 +24,6 @@ install -Dm644 "$src/dm-sflc/dm-sflc.ko" "$AIROOT/usr/lib/modules/$KVER/updates/
 install -Dm755 "$src/sflc/build/bin/sflc" "$AIROOT/usr/local/sbin/sflc"
 air depmod "$KVER"
 rm -rf "$src"
+# the source too: the installer builds the module on an installed system (DKMS), for whatever kernel it gets
+install -Dm644 "$tar" "$AIROOT/usr/share/lacuna/shufflecake/shufflecake-$SFLC_VER.tar.gz"
 echo "   shufflecake: $SFLC_VER (module for $KVER, signed with the MOK)"

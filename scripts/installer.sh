@@ -3,6 +3,16 @@ I=$LACUNA/installer
 install -Dm755 "$I/installer" "$AIROOT/usr/local/bin/installer"
 install -Dm755 "$I/harden"    "$AIROOT/usr/local/bin/harden"
 install -Dm644 "$I/installer.desktop" "$AIROOT/usr/share/applications/installer.desktop"
+# installing on Shufflecake: the new system's boot unlock, units and the modules copy (installer/sflc)
+rm -rf "$AIROOT/usr/share/lacuna/installer/sflc"; install -d "$AIROOT/usr/share/lacuna/installer/sflc"
+cp -a "$I/sflc/." "$AIROOT/usr/share/lacuna/installer/sflc/"
+for f in "$I"/sflc/{initcpio-install,unlock,modules,modules-sfs,decoy-mount,sflc-tpm}; do bash -n "$f" || die "installer: $f doesn't parse"; done
+# TPM2 enrollment at an installed system's first start (installer/tpm)
+rm -rf "$AIROOT/usr/share/lacuna/installer/tpm"; install -d "$AIROOT/usr/share/lacuna/installer/tpm"
+cp -a "$I/tpm/." "$AIROOT/usr/share/lacuna/installer/tpm/"
+bash -n "$I/tpm/tpm-enroll" || die "installer: tpm-enroll doesn't parse"
+# the rice's boot and login screens for installed systems (installer/rice)
+source "$LACUNA/scripts/rice-boot.sh"
 # the package groups the installer offers, from the sections of the ISO's own package list
 mkdir -p "$AIROOT/usr/share/lacuna/installer"
 python3 -I - "$LACUNA/profile/packages.x86_64" "$AIROOT/usr/share/lacuna/installer/groups.json" <<'PY'

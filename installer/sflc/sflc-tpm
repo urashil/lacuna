@@ -1,0 +1,7 @@
+#!/usr/bin/bash
+# sflc-tpm forget: remove the TPM copy of the decoy passphrase (the next boot asks; typing the decoy passphrase then
+# seals it again). Needed after changing the Secure Boot keys only if the decoy should stop opening by itself.
+set -eu
+[[ ${1:-} == forget ]] || { sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+rm -f /boot/sflc/decoy.cred && echo "removed: the next boot asks for a passphrase"

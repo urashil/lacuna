@@ -1,0 +1,7 @@
+#!/usr/bin/bash
+# the decoy volume (the lowest one) at /mnt/decoy when more than one is open
+set -u
+[[ $(wc -l < /run/sflc/volumes) -ge 2 ]] || exit 0
+v=$(head -1 /run/sflc/volumes)
+mkdir -p /mnt/decoy
+mountpoint -q /mnt/decoy || mount -o nodev,nosuid,noatime "/dev/mapper/$v" /mnt/decoy

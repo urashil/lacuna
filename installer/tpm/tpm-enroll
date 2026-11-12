@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+# tpm-enroll: the first start after the install binds the TPM2 to this system's own boot chain. (The installer ran
+# from the stick, whose boot measures differently, so a TPM2 enrolled then would never open the disk.) For each line
+# "UUID PCRS" in /etc/tpm-enroll/list: enroll the TPM2 with the temporary key the installer left for it, then remove
+# that key from the disk and delete it. Done once; the service disables itself.
+set -u
+L=/etc/tpm-enroll/list
+[[ -s $L ]] || exit 0
+left=()
+while read -r uuid pcrs; do
+    [[ -n $uuid ]] || continue
+    dev=/dev/disk/by-uuid/$uuid key=/etc/tpm-enroll/$uuid.key
+    if systemd-cryptenroll --unlock-key-file="$key" --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev" &&
+       cryptsetup luksRemoveKey --batch-mode --key-file "$key" "$dev"; then
+        shred -u "$key" 2>/dev/null || rm -f "$key"
+        echo "tpm-enroll: TPM2 enrolled for $uuid (PCRs $pcrs)"
+    else
+        left+=("$uuid $pcrs")
+        echo "tpm-enroll: $uuid failed; trying again at the next start" >&2
+    fi
+done < "$L"
+if ((${#left[@]})); then printf '%s\n' "${left[@]}" > "$L"; exit 1; fi
+rm -rf /etc/tpm-enroll
+systemctl disable tpm-enroll.service >/dev/null 2>&1 || true

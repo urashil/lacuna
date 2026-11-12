@@ -18,7 +18,7 @@
     <keybind key="W-d"><action name="Execute" command="sh -c 'XDG_DATA_DIRS=$LACUNA_OPSEC_SHARE fuzzel'" /></keybind>
     <keybind key="W-b"><action name="Execute" command="tor-browser" /></keybind>
     <keybind key="W-e"><action name="Execute" command="thunar" /></keybind>
-    <keybind key="W-A-l"><action name="Execute" command="lacuna-lock" /></keybind>
+    <keybind key="W-A-l"><action name="Execute" command="lock" /></keybind>
     <keybind key="W-q"><action name="Close" /></keybind>
     <keybind key="A-F4"><action name="Close" /></keybind>
     <keybind key="W-Up"><action name="ToggleMaximize" /></keybind>

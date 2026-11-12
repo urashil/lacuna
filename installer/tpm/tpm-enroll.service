@@ -1,0 +1,11 @@
+[Unit]
+Description=Bind the TPM2 to this system's boot chain (first start after the install)
+ConditionPathExists=/etc/tpm-enroll/list
+After=cryptsetup.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/tpm-enroll
+
+[Install]
+WantedBy=multi-user.target

@@ -23,6 +23,28 @@ in QEMU, so these checks happen on the laptop.
    transport message. Check: on the same network, try meek, or the new restricted-network option (item 8). Tell me
    the "Last message" if Snowflake is still stuck on an open network.
 
+## New in this build (V-Z)
+
+- **V. Password and sudo.** The greeter won't continue without a password. Leave "Admin rights (sudo)" off: in
+  the session `sudo true` must fail ("not in the sudoers file"), and Super+L / the idle lock still lock and unlock
+  with the password. Turn it on next boot: `sudo true` works. With a hidden vault, the choice is restored.
+- **W. VPNs.** PIA (WireGuard) connects and `leaktest` passes (it got stuck at "Connecting": the firewall dropped
+  WireGuard's own packets). Mullvad: log in, then shut down normally; at mullvad.net the device list must not grow
+  by one per boot. With 5 devices already, the greeter says so instead of "login failed".
+- **X. Names.** The commands are `lock`, `launch`, `greeter`, `opsec-session`; the app is "Settings".
+- **Y. Installer, unlock combinations** (a VM with a vTPM is enough for TPM2):
+  passphrase + TPM2, "all needed": boot asks for the passphrase and then unlocks the second layer by itself; the
+  install log shows a recovery key. "Any one": the TPM2 alone opens it.
+- **Z. Installer on Shufflecake.** Hidden + decoy: the decoy passphrase boots the decoy system, the hidden one
+  boots the hidden system (`ls /dev/mapper` shows both sflc volumes there). A wrong passphrase asks again.
+  After a kernel update in one system, the other one still boots (it borrows the modules: `findmnt
+  /usr/lib/modules/$(uname -r)` shows a squashfs).
+  With "The TPM opens the decoy" (Secure Boot on): the first boot asks; type the decoy passphrase. From the next
+  boot on, waiting 10 s starts the decoy by itself; the hidden passphrase within those 10 s starts hidden. In the
+  hidden system the decoy is mounted at /mnt/decoy. `sflc-tpm forget` makes the next boot ask again.
+- **AA. The rice on installed systems.** SDDM shows SilentSDDM with the wallpaper; the boot shows the rice's Plymouth
+  screen, and the disk passphrase is typed into its entry.
+
 ## Found in the Proxmox VM tests (fixed in this build)
 
 O. **Tor mode: nothing but Tor Browser could reach the internet.** The firewall redirected apps' traffic into Tor
@@ -52,7 +74,7 @@ U. **Opsec session** (greeter → Options → Session: Opsec). A minimal floatin
    - network is Tor only in Tails' model: no transparent redirect, apps reach Tor only through SOCKS, anything else
      has no network at all; no VPN modes, no Unsafe Browser (the switches are gone);
    - the launcher (Super+Space, or "Apps" on the bar) offers only Tor Browser, a terminal (foot), Thunar,
-     KeePassXC, Lacuna Settings and Persistence. Nothing starts by itself;
+     KeePassXC, Settings and Persistence. Nothing starts by itself;
    - extra apps are chosen on the "Apps for this session" screen (Thunderbird, Signal, Element, Electrum, Monero,
      SimpleX, Spotify, mpv). Each runs through `torapp` on its own Tor SOCKS port, so its own circuits;
    - keys: Super+Return terminal, Super+B Tor Browser, Super+E files, Super+Alt+L lock, Super+Q close,
@@ -66,8 +88,8 @@ I. **Your rice's VPN update** (vpnctl, the bar's VPN menu, the IVPN menu) is in.
    the bar at that VPN (`~/.config/rice/vpn.json` provider), with auto-connect off since the gate connects. Check:
    in Mullvad or IVPN mode the bar's VPN menu shows that VPN as connected; region and method changes from the
    menu work. Switching provider from the bar doesn't (it needs your root helper, which Lacuna doesn't have): use
-   Lacuna Settings.
-J. **Every TUI screen scrolls.** On every screen of the greeter, Lacuna Settings and the installer, the middle
+   Settings.
+J. **Every TUI screen scrolls.** On every screen of the greeter, Settings and the installer, the middle
    scrolls and the title, buttons and messages stay put. Checked here at 70x18 for every control on every screen.
    Check: with a big font or a small screen, Tab reaches everything and Continue/Back stay visible.
 K. **Secure Boot on the stick** (shim): Fedora's Microsoft-signed shim, then systemd-boot and the kernel signed
@@ -112,7 +134,7 @@ A. **Screens that didn't fit** (the mode screen hid Back/Continue): the middle o
    title, buttons and messages always stay visible. Check: the mode screen with "Custom bridge lines" open still
    shows Back/Continue. Tab moves into the hidden fields and scrolls to them.
 B. **Restricted network = Tor only:** "Tor connects only over port 443". PIA is left alone (back to WireGuard).
-C. **Unsafe Browser** (like Tails): switch it on in the greeter's options (or Lacuna Settings), then open **Unsafe
+C. **Unsafe Browser** (like Tails): switch it on in the greeter's options (or Settings), then open **Unsafe
    Browser** from the launcher. Chromium opens with a red warning page and http://neverssl.com (which brings up a
    Wi-Fi sign-in page). It goes straight out, not through Tor or PIA. Check:
    - with the switch off, it refuses to start ("didn't start" notification);
@@ -121,7 +143,7 @@ C. **Unsafe Browser** (like Tails): switch it on in the greeter's options (or La
    - closing it and opening it again starts empty.
 D. **Tor Browser as its own user** (`torbrowser`): it opens as before. Downloads land in ~/Downloads/Tor Browser.
    Sound works in videos. `ps -o user,cmd -C firefox` shows `torbrowser`.
-E. **Kiwix library** in the persistence: `sudo vault features enable kiwix` (or Lacuna Settings).
+E. **Kiwix library** in the persistence: `sudo vault features enable kiwix` (or Settings).
 
 ## New in the previous build
 
@@ -134,7 +156,7 @@ E. **Kiwix library** in the persistence: `sudo vault features enable kiwix` (or 
    relays on 443. Built-in obfs4 keeps only its 3 bridges on 443, and meek is HTTPS anyway. Snowflake is refused
    with this switch (it needs UDP). PIA switches to OpenVPN over TCP 443. Check: Tor and PIA both connect with it
    on, and the setting is saved in the persistence.
-9. **Lacuna Settings** (launcher), in the session:
+9. **Settings** (launcher), in the session:
    - **Network:** mode, bridges, restricted network, PIA account (a new one replaces the saved one, and is only
      saved once it has logged in). The status screen shows Tor % / PIA as in the greeter.
    - **What the persistence keeps** (hidden passphrase only): switches for SSH, GnuPG, Spotify, Thunderbird, ...
@@ -146,7 +168,7 @@ E. **Kiwix library** in the persistence: `sudo vault features enable kiwix` (or 
     - Quick test: edit the boot entry, add `lacuna.reaper=120` (seconds). Lock the screen (needs a password) and
       wait: off after 2 minutes. Unlocked, it never fires. `sudo /usr/local/lib/lacuna/reaper status` shows the
       clock.
-    - Lid close now locks through lacuna-lock as well (before, with no password set, it would have locked you
+    - Lid close now locks through lock as well (before, with no password set, it would have locked you
       out for good).
 
 ## From before (if not done yet)

@@ -4,7 +4,7 @@ set -euo pipefail
 locale-gen
 
 # live user: no persistence and no usable password (greeter-customize.sh locks it; the greeter may set one)
-id amnesia >/dev/null 2>&1 || useradd -M -u 1000 -U -G wheel,video,audio,input -s /usr/bin/zsh -d /home/amnesia amnesia
+id amnesia >/dev/null 2>&1 || useradd -M -u 1000 -U -G video,audio,input -s /usr/bin/zsh -d /home/amnesia amnesia
 # apps that run as their own user (appbox): Tor Browser, and the Unsafe Browser (the only user the firewall lets
 # out directly, and only when allowed in the greeter)
 for u in torbrowser clearnet; do

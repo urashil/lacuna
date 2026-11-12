@@ -7,7 +7,7 @@
     <item label="Terminal"><action name="Execute" command="foot" /></item>
     <item label="Files"><action name="Execute" command="thunar" /></item>
     <separator />
-    <item label="Lock"><action name="Execute" command="lacuna-lock" /></item>
+    <item label="Lock"><action name="Execute" command="lock" /></item>
     <item label="Power off"><action name="Execute" command="systemctl poweroff" /></item>
   </menu>
 </openbox_menu>

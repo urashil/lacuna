@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # leaktest [--inject]: check, from this machine, that nothing leaves except the way the network mode says
-# (milestone 4's acceptance test). Root (run through Lacuna Settings, or sudo). Exit 0 = every check passed.
+# (milestone 4's acceptance test). Root (run through Settings, or sudo). Exit 0 = every check passed.
 #   --inject   negative control: open a deliberate hole (the live user may go out directly), run the checks, which
 #              must now FAIL, then close it again. A harness that can't see an injected leak proves nothing.
 set -u

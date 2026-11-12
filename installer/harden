@@ -302,6 +302,8 @@ secureboot() {
     enroll)
       [ "$(efivar SetupMode)" = 1 ] || die "the firmware isn't in setup mode: clear its Secure Boot keys in the firmware settings first"
       local ms=(); [ "${2:-}" = --microsoft ] && ms=(--microsoft)
+      # the kernel marks existing Secure Boot variables immutable; sbctl can't replace them until that's lifted
+      local v; for v in /sys/firmware/efi/efivars/{PK,KEK,db,dbx}-*; do [ -e "$v" ] && chattr -i "$v" 2>/dev/null; done
       sbctl enroll-keys "${ms[@]}" || die "enroll failed"
       say "enrolled. Reboot, check 'harden secureboot check', then turn Secure Boot on in the firmware" ;;
     off) say "turn Secure Boot off in the firmware settings; the keys stay in /var/lib/sbctl" ;;

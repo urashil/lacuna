@@ -13,6 +13,7 @@
 #   gate apply offline     nothing but loopback
 #   gate apply direct      no filtering (only with lacuna.direct on the kernel command line: development)
 #   gate status            JSON: mode, Tor bootstrap %, VPN state
+#   gate logout            sign the VPN clients out (shutdown; Mullvad counts every login as a device)
 #   gate refresh           reload the current mode's rules only (after the Unsafe Browser was switched)
 #
 # Bridges: /run/lacuna/bridges (one bridge line per line, or "builtin:obfs4|snowflake|meek").
@@ -31,6 +32,10 @@ CREDS=$RUN/vpn-credentials
 # per VPN: its daemon's unit (the firewall lets that cgroup out, to build the tunnel) and its tunnel interfaces
 vpn_unit() { case $1 in pia) echo piavpn.service ;; mullvad) echo mullvad-daemon.service ;; ivpn) echo ivpn-service.service ;; esac; }
 vpn_ifs()  { case $1 in pia) echo '{ "wgpia0", "tun0" }' ;; mullvad) echo '{ "wg0-mullvad", "tun0" }' ;; ivpn) echo '{ "wgivpn", "tun0" }' ;; esac; }
+# WireGuard sends its packets from the kernel, not from the daemon's sockets: the cgroup rule never sees them. Each
+# client marks its tunnel's packets (SO_MARK / fwmark) so its own routing can tell them apart; the gate lets that mark
+# out. (Setting a mark takes CAP_NET_ADMIN, i.e. root, which could rewrite the firewall anyway.) IVPN: not verified.
+vpn_mark() { case $1 in pia) echo 0x3213 ;; mullvad) echo 0x6d6f6c65 ;; ivpn) echo "" ;; esac; }
 vpn_name() { case $1 in pia) echo PIA ;; mullvad) echo Mullvad ;; ivpn) echo IVPN ;; esac; }
 
 die() { echo "gate: $*" >&2; exit 1; }
@@ -56,10 +61,12 @@ ruleset() {   # $1 = mode
                   'meta skuid != "tor" udp dport 53 redirect to :5353') ;;
         pia|mullvad|ivpn)
             out+=("oifname $(vpn_ifs "$1") accept"
-                  "socket cgroupv2 level 2 \"system.slice/$(vpn_unit "$1")\" accept") ;;
+                  "socket cgroupv2 level 2 \"system.slice/$(vpn_unit "$1")\" accept")
+            [[ -n $(vpn_mark "$1") ]] && out+=("meta mark $(vpn_mark "$1") accept") ;;
         tor+pia|tor+mullvad|tor+ivpn)
             out+=("meta skuid \"tor\" oifname $(vpn_ifs "${1#tor+}") accept"
                   "socket cgroupv2 level 2 \"system.slice/$(vpn_unit "${1#tor+}")\" accept")
+            [[ -n $(vpn_mark "${1#tor+}") ]] && out+=("meta mark $(vpn_mark "${1#tor+}") accept")
             nat+=('meta skuid != "tor" ip daddr != 127.0.0.0/8 meta l4proto tcp redirect to :9040'
                   'meta skuid != "tor" udp dport 53 redirect to :5353') ;;
         offline) ;;
@@ -181,9 +188,15 @@ vpn_login() {   # $1 = vpn; credentials from $CREDS (deleted afterwards whatever
         esac
         ((ok)) && break
         echo "gate: $1 login: $out" >&2       # the message only, never the credentials
+        # every login is a new "device" for Mullvad (5 at most): a fresh system each boot uses one up unless it logs out
+        # (vpn-logout.service does at shutdown); retrying won't free one
+        [[ $1 == mullvad && $out == *"too many devices"* ]] && break
         sleep 3
     done
     rm -f "$CREDS"
+    if ! ((ok)) && [[ $1 == mullvad && $out == *"too many devices"* ]]; then
+        die "Mullvad: this account already has 5 devices. Remove one at mullvad.net (Account > Devices), then try again"
+    fi
     ((ok)) || die "$(vpn_name "$1") login failed: $(oneline "$out")"
 }
 
@@ -204,13 +217,17 @@ start_vpn() {   # $1 = vpn
         mullvad) out=$(timeout 60 mullvad connect --wait 2>&1) || die "Mullvad did not connect: $(oneline "$out")" ;;
         ivpn)    out=$(timeout 60 ivpn connect -fastest 2>&1) || die "IVPN did not connect: $(oneline "$out")" ;;
     esac
+    # piactl connect returns at once, and a tunnel that's up but can't reach its server stays "Connecting": only a
+    # finished connection counts
+    for _ in $(seq 60); do vpn_connected "$v" && return 0; sleep 1; done
+    die "$(vpn_name "$v") did not finish connecting (state: $(vpn_state "$v" || true))"
 }
 
 rice_provider() {   # the bar's VPN menu (vpnctl) follows ~/.config/rice/vpn.json: point it at the VPN in use
     local f=/home/amnesia/.config/rice/vpn.json cur
     id amnesia >/dev/null 2>&1 || return 0
     install -d -o amnesia -g amnesia "$(dirname "$f")"
-    cur=$(cat "$f" 2>/dev/null); jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
+    cur=$(cat "$f" 2>/dev/null || true); jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
     # autoConnect off: the gate connects (and in the Tor modes no VPN daemon runs at all)
     jq --arg p "$1" '.provider = $p | .autoConnect = false' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
     chown amnesia:amnesia "$f"
@@ -272,7 +289,20 @@ status() {
         "$mode" "$tor_pct" "$vpn" "$vstate" "$note" "$([[ -e $RUN/restricted ]] && echo 1 || echo 0)"
 }
 
+logout() {   # at shutdown (vpn-logout.service): sign the running VPN clients out, so the account forgets this system
+    local v
+    for v in $VPNS; do
+        systemctl -q is-active "$(vpn_unit "$v")" || continue
+        case $v in
+            pia)     timeout 15 piactl logout >/dev/null 2>&1 || true ;;
+            mullvad) timeout 15 mullvad account logout >/dev/null 2>&1 || true ;;   # revokes this device
+            ivpn)    timeout 15 ivpn logout >/dev/null 2>&1 || true ;;
+        esac
+    done
+}
+
 case ${1:-} in
+    logout) logout ;;
     apply)  [[ -n ${2:-} ]] || die "usage: gate apply MODE"; apply "$2" ;;
     status) status "${2:-}" ;;
     refresh) load "$(cat "$MODEFILE" 2>/dev/null || echo greeter)" ;;   # rules only (the Unsafe Browser switch)

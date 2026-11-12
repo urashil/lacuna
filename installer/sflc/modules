@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+# initrd, after the root is mounted: the volumes share one EFI partition, so the kernel that boots is whichever
+# system updated it last. When this system doesn't have that kernel's modules, use the copy its updater left on
+# the EFI partition (/boot/sflc-modules/VERSION.sfs), read into RAM and mounted over the missing directory.
+. /etc/sflc-root.conf                    # ESP=/dev/disk/by-partuuid/...
+k=$(uname -r)
+[[ -d /sysroot/usr/lib/modules/$k/kernel ]] && exit 0
+mkdir -p /run/sflc/esp
+mount -t vfat -o ro "$ESP" /run/sflc/esp || exit 0
+if [[ -f /run/sflc/esp/sflc-modules/$k.sfs ]]; then
+    cp "/run/sflc/esp/sflc-modules/$k.sfs" /run/sflc/modules.sfs
+fi
+umount /run/sflc/esp
+[[ -f /run/sflc/modules.sfs ]] || { echo "sflc: no modules for $k on this system" >/dev/console; exit 0; }
+mkdir -p "/sysroot/usr/lib/modules/$k"
+mount -t squashfs -o ro,loop /run/sflc/modules.sfs "/sysroot/usr/lib/modules/$k"

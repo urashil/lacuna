@@ -1,0 +1,15 @@
+[Unit]
+Description=Sign the VPN clients out at shutdown (each login is a device on the account)
+# stopping runs in reverse order: this stops before the VPN daemons and the network, while they can still reach the
+# provider's API (the firewall lets each daemon reach it)
+After=network.target NetworkManager.service piavpn.service mullvad-daemon.service ivpn-service.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/lib/lacuna/gate logout
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

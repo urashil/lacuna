@@ -1,0 +1,35 @@
+#!/bin/bash
+# mkinitcpio hook "sflc" (installed systems on Shufflecake): one passphrase prompt at boot. The passphrase of
+# volume N opens volumes 1..N; the highest one opened holds the system that boots (the hidden one, or the decoy).
+# Needs the systemd hook before it (add_systemd_unit, ask-password).
+
+build() {
+    map add_module dm-sflc dm-mod loop squashfs vfat nls_cp437 'nls_iso8859_1?' 'nls_ascii?'
+    map add_binary /usr/local/sbin/sflc /usr/bin/bash /usr/bin/dmsetup /usr/bin/blockdev /usr/bin/systemd-ask-password \
+        /usr/bin/mount /usr/bin/umount /usr/bin/cp /usr/bin/mkdir /usr/bin/sort /usr/bin/tail /usr/bin/ls /usr/bin/uname \
+        /usr/bin/sleep /usr/bin/grep /usr/bin/udevadm /usr/bin/sed
+    map add_udev_rule '10-dm.rules' '13-dm-disk.rules' '95-dm-notify.rules'
+    map add_systemd_unit 'systemd-ask-password-console.path' 'systemd-ask-password-console.service'
+    add_file /etc/sflc-root.conf /etc/sflc-root.conf 644
+    map add_binary /usr/bin/wc /usr/bin/mv /usr/bin/rm /usr/bin/sync
+    if grep -q '^TPM=1' /etc/sflc-root.conf; then
+        # the decoy opens by itself through the TPM: systemd-creds, its TPM libraries (loaded at run time) and drivers
+        add_binary /usr/bin/systemd-creds
+        local lib
+        for lib in /usr/lib/libtss2-*.so*; do
+            if [[ -L $lib ]]; then add_symlink "$lib"; else add_binary "$lib"; fi
+        done
+        add_checked_modules '/drivers/char/tpm/'
+    fi
+    add_file /usr/local/lib/sflc/unlock /usr/local/lib/sflc/unlock 755
+    add_file /usr/local/lib/sflc/modules /usr/local/lib/sflc/modules 755
+    local u
+    for u in sflc-unlock.service sflc-modules.service; do
+        add_file "/usr/local/lib/sflc/$u" "/usr/lib/systemd/system/$u" 644
+        add_symlink "/usr/lib/systemd/system/initrd.target.wants/$u" "../$u"
+    done
+}
+
+help() {
+    echo "Unlocks a Shufflecake system volume at boot (one passphrase; the highest volume it opens becomes the root)."
+}

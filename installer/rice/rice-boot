@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# rice-boot USER [sddm]: the rice's boot and login screens on an installed system, the way the dotfiles' deps.sh and
+# boot/boot-theme.sh set them up. Runs inside the new system (the installer copies this folder to /tmp first).
+#   - Plymouth: the dotfiles' "rice" theme (blurred wallpaper, spinner, the disk-passphrase entry), from USER's
+#     wallpaper and palette; make_plymouth_art comes from the dotfiles' boot-theme.sh as built (plymouth-art.sh)
+#   - sddm: SilentSDDM (pinned in the ISO) with the rice's colours and wallpaper; those two files belong to USER, so
+#     rice-theme-sync keeps them following the wallpaper
+set -euo pipefail
+U=${1:?user}; SDDM=${2:-}
+UH=$(getent passwd "$U" | cut -d: -f6)
+R=$(cd "$(dirname "$0")" && pwd)
+COLORS=$UH/.cache/rice/colors.json
+[[ -r $COLORS ]] || COLORS=$UH/.config/quickshell/bar/colors.json
+WALL=$(cat "$UH/.cache/rice/current" 2>/dev/null || true)
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+need() { command -v "$1" >/dev/null || { echo "rice-boot: missing $1" >&2; exit 1; }; }
+col() {   # a palette colour, with a fallback for palettes that name it differently
+    python3 -I -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+print(next(d[k] for k in sys.argv[2:] if k in d).lstrip("#"))' "$COLORS" "$@"
+}
+[[ -r $COLORS ]] || { echo "rice-boot: no palette ($COLORS)" >&2; exit 1; }
+SURFACE=$(col surface background); PRIMARY=$(col primary); HIGH=$(col surfaceHigh surfaceContainerHigh surface)
+TEXT=$(col text onSurface primary)
+
+# --- Plymouth ---
+. "$R/plymouth-art.sh"
+make_plymouth_art "$WORK/ply"
+T=/usr/share/plymouth/themes/rice
+rm -rf "$T"; install -d "$T"
+install -m644 "$WORK"/ply/*.png "$WORK/ply/rice.script" "$T/"
+cat > "$T/rice.plymouth" <<PLY
+[Plymouth Theme]
+Name=Rice
+Description=Wallpaper-derived boot screen matching the lock screen
+ModuleName=script
+
+[script]
+ImageDir=$T
+ScriptFile=$T/rice.script
+PLY
+plymouth-set-default-theme rice
+echo "rice-boot: plymouth theme 'rice'"
+
+# --- SDDM ---
+[[ $SDDM == sddm ]] || exit 0
+S=/usr/share/sddm/themes/silent
+rm -rf "$S"; install -d /usr/share/sddm/themes; cp -a "$R/silent" "$S"
+install -d /usr/share/fonts/silent-sddm
+cp -a "$S"/fonts/* /usr/share/fonts/silent-sddm/ 2>/dev/null && fc-cache -f >/dev/null 2>&1 || true
+install -Dm644 "$R/sddm.conf" /etc/sddm.conf
+if [[ -f $UH/.cache/rice/sddm.conf ]]; then cp "$UH/.cache/rice/sddm.conf" "$S/configs/rice.conf"
+else cp "$S/configs/default.conf" "$S/configs/rice.conf"; fi
+if [[ -f $WALL ]]; then cp "$WALL" "$S/backgrounds/rice-bg.png"
+else cp "$S/backgrounds/smoky.jpg" "$S/backgrounds/rice-bg.png"; fi
+chown "$U": "$S/configs/rice.conf" "$S/backgrounds/rice-bg.png"
+chmod 644 "$S/configs/rice.conf" "$S/backgrounds/rice-bg.png"
+sed -i 's|^ConfigFile=configs/[A-Za-z0-9_-]*\.conf|ConfigFile=configs/rice.conf|' "$S/metadata.desktop"
+# the session it offers first: niri (labwc, the live opsec session's compositor, would sort before it)
+if [[ -f /usr/share/wayland-sessions/niri.desktop ]]; then
+    install -d -o sddm -g sddm /var/lib/sddm 2>/dev/null || install -d /var/lib/sddm
+    printf '[Last]\nSession=/usr/share/wayland-sessions/niri.desktop\nUser=%s\n' "$U" > /var/lib/sddm/state.conf
+    chown sddm:sddm /var/lib/sddm/state.conf 2>/dev/null || true
+fi
+systemctl enable sddm >/dev/null
+echo "rice-boot: sddm with SilentSDDM"

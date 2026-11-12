@@ -1,0 +1,13 @@
+#!/usr/bin/bash
+# pacman hook (after the kernel, DKMS and mkinitcpio): keep a squashfs of this system's newest kernel modules on the
+# EFI partition, so the other system on this disk can boot this kernel too (see /usr/local/lib/sflc/modules).
+set -u
+d=/boot/sflc-modules
+mkdir -p "$d"
+for m in /usr/lib/modules/*/; do
+    k=$(basename "$m")
+    [[ -f $m/vmlinuz && -d $m/kernel ]] || continue
+    mksquashfs "$m" "$d/$k.sfs.new" -noappend -comp zstd -quiet >/dev/null && mv "$d/$k.sfs.new" "$d/$k.sfs"
+done
+# the EFI partition is small: only the two newest
+ls -1t "$d"/*.sfs 2>/dev/null | tail -n +3 | xargs -r rm -f

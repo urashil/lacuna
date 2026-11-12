@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount the decoy volume beside the hidden system (Shufflecake)
+# booted with the hidden passphrase, the decoy volume is open too (that's what keeps its data safe); mount it so
+# its files can be used from here. Booted with the decoy passphrase there is only one volume: nothing to do.
+ConditionPathExists=/run/sflc/volumes
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/sflc/decoy-mount
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,82 @@
+#!/usr/bin/bash
+# initrd: open the system volume, then map the highest volume opened as /dev/mapper/root.
+#   - one passphrase prompt: the passphrase of volume N opens volumes 1..N (Shufflecake), so the hidden passphrase
+#     opens the hidden system with the decoy open beside it, which keeps the decoy's data safe while hidden runs
+#   - TPM=1 (sflc-root.conf): the prompt waits TIMEOUT seconds; nothing typed -> the TPM opens the decoy. The decoy
+#     passphrase is sealed to this machine's Secure Boot state (PCR 7) the first time it's typed here, because only
+#     this boot chain measures what later boots will (the install ran from the stick, which measures differently)
+# A wrong passphrase and "nothing here" look the same to Shufflecake; it just asks again. The screen is the same
+# for a hidden + decoy disk and a decoy-only one.
+. /etc/sflc-root.conf                    # DEV ESP [TPM TIMEOUT]
+# the initrd's services get a bare PATH: sflc lives in /usr/local/sbin
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin
+CRED_DIR=/run/sflc/esp/sflc CRED=/run/sflc/esp/sflc/decoy.cred
+for m in dm-sflc loop squashfs vfat nls_cp437 nls_iso8859_1 nls_ascii; do modprobe -q "$m" 2>/dev/null; done
+for ((i = 0; i < 120; i++)); do [[ -b $DEV ]] && break; sleep 0.5; done
+[[ -b $DEV ]] || { echo "sflc: $DEV not found" >/dev/console; exit 1; }
+mkdir -p /run/sflc/esp
+
+say() {
+    if command -v plymouth >/dev/null && plymouth --ping 2>/dev/null; then plymouth display-message --text="$1"
+    else echo "$1" >/dev/console; fi
+}
+opened() {     # the open Shufflecake volumes, lowest first, as the kernel lists them (udev may not have made the
+               # /dev/mapper nodes yet: judging by those, a passphrase that worked looked wrong, and every later try
+               # then failed with "already open")
+    local n _
+    dmsetup ls 2>/dev/null | while read -r n _; do [[ $n == sflc_* ]] && echo "$n"; done | sort -t_ -k3 -n
+}
+try_open() {   # $1 = passphrase; succeeds when something is open
+    local out top i
+    out=$(printf '%s\n' "$1" | sflc open "$DEV" 2>&1)
+    top=$(opened | tail -1)
+    if [[ -z $top ]]; then
+        # Shufflecake's own reason (it never prints the passphrase), on the text console only (Esc in the boot
+        # screen): a wrong passphrase and a broken boot image otherwise look the same
+        [[ -d /sys/module/dm_sflc ]] || echo "sflc: the dm-sflc kernel module isn't loaded" >/dev/console
+        printf '%s\n' "$out" | grep -iE 'error|fail' | tail -1 | sed 's/^/sflc: /' >/dev/console
+        return 1
+    fi
+    udevadm settle --timeout=10 2>/dev/null
+    for ((i = 0; i < 50; i++)); do [[ -b /dev/mapper/$top ]] && break; sleep 0.2; done
+    return 0
+}
+esp() { umount /run/sflc/esp 2>/dev/null; mount -t vfat -o "$1" "$ESP" /run/sflc/esp 2>/dev/null; }
+tpm_decoy() {  # the decoy passphrase from the TPM (fails if it was never sealed or the boot chain changed)
+    [[ ${TPM:-0} == 1 ]] && esp ro && [[ -f $CRED ]] &&
+        systemd-creds decrypt --with-key=tpm2 --name=sflc-decoy "$CRED" - 2>/dev/null
+}
+seal_decoy() { # $1 = the decoy passphrase, just typed: seal it for the next boots
+    [[ ${TPM:-0} == 1 ]] || return 0
+    esp rw || return 0
+    mkdir -p "$CRED_DIR"
+    printf '%s' "$1" | systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs=7 --name=sflc-decoy - "$CRED.new" 2>/dev/null &&
+        mv "$CRED.new" "$CRED" && sync
+    rm -f "$CRED.new"
+}
+
+while :; do
+    if [[ ${TPM:-0} == 1 ]]; then
+        pw=$(systemd-ask-password --timeout="${TIMEOUT:-10}" --id=sflc:root "Passphrase:") || pw=""
+        if [[ -z $pw ]]; then
+            if dpw=$(tpm_decoy) && try_open "$dpw"; then unset dpw; break; fi
+            unset dpw
+            [[ -n $(opened) ]] && break
+            # nothing sealed yet (first boot) or the boot chain changed: ask until something opens
+            pw=$(systemd-ask-password --timeout=0 --id=sflc:root "Passphrase:") || continue
+        fi
+    else
+        pw=$(systemd-ask-password --timeout=0 --id=sflc:root "Passphrase:") || continue
+    fi
+    if try_open "$pw"; then
+        # one volume opened: that was the decoy passphrase (the hidden one opens both)
+        [[ $(opened | wc -l) == 1 ]] && seal_decoy "$pw"
+        break
+    fi
+    say "That passphrase opens nothing here."
+done
+unset pw
+umount /run/sflc/esp 2>/dev/null
+top=$(opened | tail -1)
+opened > /run/sflc/volumes             # for the running system (sflc-decoy: mounts the decoy beside hidden)
+dmsetup create root --table "0 $(blockdev --getsz "/dev/mapper/$top") linear /dev/mapper/$top 0"
